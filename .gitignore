@@ -1,0 +1,4 @@
+node_modules/
+.env
+favorites.json
+radio.json
