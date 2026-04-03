@@ -97,6 +97,77 @@ function isUrl(s) {
   return s.startsWith('http://') || s.startsWith('https://');
 }
 
+function isSpotifyUrl(s) {
+  return /^https?:\/\/open\.spotify\.com\/(track|album|playlist)\//.test(s);
+}
+
+// Spotify token cache (client credentials — no user login needed)
+let _spotifyToken = null;
+let _spotifyTokenExpiry = 0;
+
+async function getSpotifyToken() {
+  if (_spotifyToken && Date.now() < _spotifyTokenExpiry) return _spotifyToken;
+  const creds = Buffer.from(`${process.env.SPOTIFY_CLIENT_ID}:${process.env.SPOTIFY_CLIENT_SECRET}`).toString('base64');
+  const res = await fetch('https://accounts.spotify.com/api/token', {
+    method: 'POST',
+    headers: { 'Authorization': `Basic ${creds}`, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: 'grant_type=client_credentials',
+  });
+  const data = await res.json();
+  if (!data.access_token) throw new Error('Spotify auth failed — check SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET in .env');
+  _spotifyToken = data.access_token;
+  _spotifyTokenExpiry = Date.now() + (data.expires_in - 60) * 1000;
+  return _spotifyToken;
+}
+
+// Returns array of { title, uploader } from a Spotify track/album/playlist URL
+async function resolveSpotifyUrl(url) {
+  const token = await getSpotifyToken();
+  const match = url.match(/open\.spotify\.com\/(track|album|playlist)\/([A-Za-z0-9]+)/);
+  if (!match) throw new Error('Invalid Spotify URL');
+  const [, type, id] = match;
+  const headers = { 'Authorization': `Bearer ${token}` };
+  const PLAYLIST_CAP = 100;
+
+  if (type === 'track') {
+    const res = await fetch(`https://api.spotify.com/v1/tracks/${id}`, { headers });
+    const data = await res.json();
+    return [{ title: data.name, uploader: data.artists.map(a => a.name).join(', ') }];
+  }
+
+  if (type === 'album') {
+    const tracks = [];
+    let next = `https://api.spotify.com/v1/albums/${id}/tracks?limit=50`;
+    while (next && tracks.length < PLAYLIST_CAP) {
+      const res = await fetch(next, { headers });
+      const data = await res.json();
+      for (const track of data.items) {
+        if (tracks.length >= PLAYLIST_CAP) break;
+        tracks.push({ title: track.name, uploader: track.artists.map(a => a.name).join(', ') });
+      }
+      next = data.next;
+    }
+    return tracks;
+  }
+
+  if (type === 'playlist') {
+    const tracks = [];
+    let next = `https://api.spotify.com/v1/playlists/${id}/tracks?limit=100&fields=next,items(track(name,artists))`;
+    while (next && tracks.length < PLAYLIST_CAP) {
+      const res = await fetch(next, { headers });
+      const data = await res.json();
+      for (const item of data.items) {
+        if (tracks.length >= PLAYLIST_CAP) break;
+        if (item.track?.name) tracks.push({ title: item.track.name, uploader: item.track.artists.map(a => a.name).join(', ') });
+      }
+      next = data.next;
+    }
+    return tracks;
+  }
+
+  throw new Error('Unsupported Spotify URL type');
+}
+
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
@@ -237,13 +308,20 @@ function getPlaylistEntries(url) {
   });
 }
 
-function getSongInfo(url) {
+function getSongInfo(url, attempt = 0) {
   return new Promise((resolve, reject) => {
-    const proc = spawn('yt-dlp', ['--dump-json', '--no-playlist', '-f', 'bestaudio', url]);
+    const proc = spawn('yt-dlp', ['--dump-json', '--no-playlist', '-f', 'bestaudio/best', url]);
     let data = '';
     proc.stdout.on('data', chunk => (data += chunk));
     proc.on('close', code => {
-      if (code !== 0) return reject(new Error('Could not fetch song info'));
+      if (code !== 0) {
+        if (attempt < 2) {
+          setTimeout(() => getSongInfo(url, attempt + 1).then(resolve).catch(reject), 1000);
+        } else {
+          reject(new Error('Could not fetch song info'));
+        }
+        return;
+      }
       try {
         const info = JSON.parse(data);
         resolve({
@@ -331,6 +409,9 @@ function ensurePlayer(guild, voiceChannel, textChannel) {
     queue.player.on(AudioPlayerStatus.Idle, async () => {
       try {
         if (queue.loop && queue.currentSong) {
+          if (queue.currentSong.url && queue.currentSong.url.includes('soundcloud.com')) {
+            queue.currentSong.streamUrl = null;
+          }
           await playSong(queue.guild, queue.currentSong);
         } else if (queue.songs.length > 0) {
           await playSong(queue.guild, queue.songs.shift());
@@ -422,6 +503,37 @@ client.on('interactionCreate', async interaction => { try {
 
       // URL: play immediately (existing behavior)
       if (isUrl(input)) {
+        // Spotify track/album/playlist — resolve metadata then search YouTube for each track
+        if (isSpotifyUrl(input)) {
+          try {
+            const tracks = await resolveSpotifyUrl(input);
+            const isMulti = tracks.length > 1;
+            for (const track of tracks) {
+              queue.songs.push({
+                title: track.title,
+                uploader: track.uploader,
+                duration: null,
+                thumbnail: null,
+                url: `ytsearch1:${track.uploader} ${track.title}`,
+                streamUrl: null,
+                requestedBy: interaction.user.username,
+              });
+            }
+            const isNew = ensurePlayer(interaction.guild, voiceChannel, interaction.channel);
+            if (isNew) {
+              const next = queue.songs.shift();
+              await playSong(interaction.guild, next);
+              await interaction.editReply({ content: isMulti ? `Queued **${tracks.length} songs** from Spotify. Now playing **${next.title}**` : `Now playing **${next.title}**` });
+            } else {
+              await interaction.editReply({ content: isMulti ? `Added **${tracks.length} songs** from Spotify to the queue.` : `Added **${tracks[0].title}** to the queue. Position: ${queue.songs.length}` });
+            }
+          } catch (err) {
+            console.error(err);
+            await interaction.editReply({ content: `Could not load that Spotify link. ${err.message}` });
+          }
+          return;
+        }
+
         try {
           const entries = await getPlaylistEntries(input);
           const isPlaylist = entries.length > 1;

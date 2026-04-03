@@ -4,10 +4,10 @@ require('dotenv').config();
 const commands = [
   new SlashCommandBuilder()
     .setName('play')
-    .setDescription('Play a song from a SoundCloud or YouTube URL')
+    .setDescription('Play a song by name or URL')
     .addStringOption(option =>
-      option.setName('url')
-        .setDescription('SoundCloud or YouTube URL')
+      option.setName('song')
+        .setDescription('URL or Song Title')
         .setRequired(true)
     ),
   new SlashCommandBuilder()
@@ -25,6 +25,34 @@ const commands = [
   new SlashCommandBuilder()
     .setName('queue')
     .setDescription('Show the current queue'),
+  new SlashCommandBuilder()
+    .setName('remove')
+    .setDescription('Remove a song from the queue by position')
+    .addIntegerOption(option =>
+      option.setName('number')
+        .setDescription('Position in the queue to remove (1 = next up)')
+        .setRequired(true)
+        .setMinValue(1)
+    ),
+  new SlashCommandBuilder()
+    .setName('volume')
+    .setDescription('Set playback volume (0-150)')
+    .addIntegerOption(option =>
+      option.setName('level')
+        .setDescription('Volume level (0 = mute, 100 = normal, 150 = max)')
+        .setRequired(true)
+        .setMinValue(0)
+        .setMaxValue(150)
+    ),
+  new SlashCommandBuilder()
+    .setName('history')
+    .setDescription('Show the last 10 songs played on this server'),
+  new SlashCommandBuilder()
+    .setName('stats')
+    .setDescription('Show top requesters and most played songs for this server'),
+  new SlashCommandBuilder()
+    .setName('help')
+    .setDescription('Show a guide to all HypeBot commands and buttons'),
   new SlashCommandBuilder()
     .setName('fav')
     .setDescription('Manage your favorite songs')
