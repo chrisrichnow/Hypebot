@@ -1,0 +1,7 @@
+app = 'music-bot-billowing-lake-2690'
+primary_region = 'dfw'
+
+[[vm]]
+  memory = '1gb'
+  cpu_kind = 'shared'
+  cpus = 1

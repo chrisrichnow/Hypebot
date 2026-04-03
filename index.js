@@ -198,6 +198,7 @@ function getQueue(guildId) {
       volume: 100,
       bassBoost: false,
       autoplay: false,
+      advancing: false,
     });
   }
   return queues.get(guildId);
@@ -350,6 +351,8 @@ function createStream(streamUrl, volume, bassBoost) {
   const filter = buildAudioFilter(volume != null ? volume : 100, bassBoost || false);
   const ffmpeg = spawn('ffmpeg', [
     '-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '5',
+    '-reconnect_on_http_error', '4xx,5xx',
+    '-timeout', '15000000',
     '-probesize', '32', '-analyzeduration', '0',
     '-i', streamUrl,
     '-filter:a', filter,
@@ -388,6 +391,61 @@ async function tryAutoplay(guild) {
   }
 }
 
+async function playNext(guild) {
+  const queue = getQueue(guild.id);
+  if (!queue.player || queue.advancing) return;
+  queue.advancing = true;
+  try {
+    if (queue.loop && queue.currentSong) {
+      if (queue.currentSong.url?.includes('soundcloud.com')) {
+        queue.currentSong.streamUrl = null;
+      }
+      await playSong(guild, queue.currentSong);
+      return;
+    }
+
+    const next = queue.songs.length > 0 ? queue.songs.shift()
+               : queue.radioSongs.length > 0 ? queue.radioSongs.shift()
+               : null;
+
+    if (next) {
+      await playSong(guild, next);
+      return;
+    }
+
+    // Nothing queued — try autoplay
+    const didAutoplay = await tryAutoplay(guild);
+    if (didAutoplay && queue.songs.length > 0) {
+      await playSong(guild, queue.songs.shift());
+      return;
+    }
+
+    // Truly empty — disconnect
+    if (queue.connection) queue.connection.destroy();
+    queue.connection = null;
+    queue.player = null;
+    queue.currentSong = null;
+    queue.voiceChannelId = null;
+    updateHub(guild);
+  } catch (err) {
+    console.error('Error playing next song, skipping:', err.message);
+    queue.advancing = false;
+    // Chain to next song instead of stopping
+    if (queue.songs.length > 0 || queue.radioSongs.length > 0) {
+      await playNext(guild);
+    } else {
+      if (queue.connection) queue.connection.destroy();
+      queue.connection = null;
+      queue.player = null;
+      queue.currentSong = null;
+      queue.voiceChannelId = null;
+      updateHub(guild);
+    }
+  } finally {
+    queue.advancing = false;
+  }
+}
+
 function ensurePlayer(guild, voiceChannel, textChannel) {
   const queue = getQueue(guild.id);
   queue.guild = guild;
@@ -406,43 +464,15 @@ function ensurePlayer(guild, voiceChannel, textChannel) {
     queue.player = createAudioPlayer();
     queue.connection.subscribe(queue.player);
 
-    queue.player.on(AudioPlayerStatus.Idle, async () => {
-      try {
-        if (queue.loop && queue.currentSong) {
-          if (queue.currentSong.url && queue.currentSong.url.includes('soundcloud.com')) {
-            queue.currentSong.streamUrl = null;
-          }
-          await playSong(queue.guild, queue.currentSong);
-        } else if (queue.songs.length > 0) {
-          await playSong(queue.guild, queue.songs.shift());
-        } else if (queue.radioSongs.length > 0) {
-          await playSong(queue.guild, queue.radioSongs.shift());
-        } else {
-          // Try autoplay before disconnecting
-          const didAutoplay = await tryAutoplay(queue.guild);
-          if (didAutoplay && queue.songs.length > 0) {
-            await playSong(queue.guild, queue.songs.shift());
-            return;
-          }
-          queue.connection.destroy();
-          queue.connection = null;
-          queue.player = null;
-          queue.currentSong = null;
-          queue.voiceChannelId = null;
-          updateHub(queue.guild);
-        }
-      } catch (err) {
-        console.error('Error playing next song, skipping:', err.message);
-        // Song failed to load — try the next one immediately
-        if (queue.songs.length > 0) {
-          await playSong(queue.guild, queue.songs.shift()).catch(e => console.error('Skip also failed:', e.message));
-        } else if (queue.radioSongs.length > 0) {
-          await playSong(queue.guild, queue.radioSongs.shift()).catch(e => console.error('Radio skip also failed:', e.message));
-        }
+    queue.player.on(AudioPlayerStatus.Idle, () => playNext(queue.guild));
+
+    queue.player.on('error', err => {
+      console.error('Player error:', err.message);
+      // Clear cached stream URL on error — SoundCloud CDN URLs expire quickly
+      if (queue.currentSong?.url?.includes('soundcloud.com')) {
+        queue.currentSong.streamUrl = null;
       }
     });
-
-    queue.player.on('error', err => console.error('Player error:', err));
     return true;
   }
   return false;
@@ -454,11 +484,7 @@ function kickstart(guild) {
   const queue = getQueue(guild.id);
   if (!queue.player) return;
   if (queue.player.state.status !== AudioPlayerStatus.Idle) return;
-  if (queue.songs.length > 0) {
-    playSong(guild, queue.songs.shift());
-  } else if (queue.radioSongs.length > 0) {
-    playSong(guild, queue.radioSongs.shift());
-  }
+  playNext(guild);
 }
 
 client.once('ready', async () => {
@@ -843,7 +869,14 @@ client.on('interactionCreate', async interaction => { try {
     if (interaction.customId === 'skip') {
       if (!queue.player) return interaction.reply({ content: 'Nothing is playing.', ephemeral: true });
 
-      // Vote skip logic
+      // Admins skip instantly
+      if (interaction.member.permissions.has('Administrator')) {
+        skipVotes.set(interaction.guild.id, new Set());
+        queue.player.stop();
+        return interaction.reply({ content: 'Skipped.', ephemeral: true });
+      }
+
+      // Vote skip logic for everyone else
       const guildId = interaction.guild.id;
       if (!skipVotes.has(guildId)) skipVotes.set(guildId, new Set());
       const votes = skipVotes.get(guildId);
