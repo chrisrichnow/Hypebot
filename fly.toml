@@ -1,6 +1,10 @@
 app = 'music-bot-billowing-lake-2690'
 primary_region = 'dfw'
 
+[mounts]
+  source = "hypebot_data"
+  destination = "/data"
+
 [[vm]]
   memory = '1gb'
   cpu_kind = 'shared'

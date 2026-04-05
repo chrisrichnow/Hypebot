@@ -6,6 +6,9 @@ const {
   ButtonBuilder,
   ButtonStyle,
   StringSelectMenuBuilder,
+  ModalBuilder,
+  TextInputBuilder,
+  TextInputStyle,
 } = require('discord.js');
 const {
   joinVoiceChannel,
@@ -19,8 +22,11 @@ const fs = require('fs');
 const path = require('path');
 require('dotenv').config();
 
+// --- Persistent data directory ---
+const DATA_DIR = process.env.DATA_DIR || '/data';
+
 // --- Favorites storage ---
-const FAVORITES_FILE = path.join(__dirname, 'favorites.json');
+const FAVORITES_FILE = path.join(DATA_DIR, 'favorites.json');
 
 function loadFavorites() {
   if (!fs.existsSync(FAVORITES_FILE)) return {};
@@ -48,7 +54,7 @@ function setUserFavorites(userId, username, list) {
 }
 
 // --- Community Radio storage ---
-const RADIO_FILE = path.join(__dirname, 'radio.json');
+const RADIO_FILE = path.join(DATA_DIR, 'radio.json');
 
 function loadRadio() {
   if (!fs.existsSync(RADIO_FILE)) return [];
@@ -60,7 +66,7 @@ function saveRadio(data) {
 }
 
 // --- History storage ---
-const HISTORY_FILE = path.join(__dirname, 'history.json');
+const HISTORY_FILE = path.join(DATA_DIR, 'history.json');
 
 function loadHistory() {
   if (!fs.existsSync(HISTORY_FILE)) return [];
@@ -69,6 +75,51 @@ function loadHistory() {
 
 function saveHistory(data) {
   fs.writeFileSync(HISTORY_FILE, JSON.stringify(data, null, 2));
+}
+
+// --- Playlists storage ---
+// Structure: { userId: { username, playlists: { name: { name, songs: [], createdAt } } } }
+const PLAYLISTS_FILE = path.join(DATA_DIR, 'playlists.json');
+
+function loadPlaylists() {
+  if (!fs.existsSync(PLAYLISTS_FILE)) return {};
+  try { return JSON.parse(fs.readFileSync(PLAYLISTS_FILE, 'utf8')); } catch { return {}; }
+}
+
+function savePlaylists(data) {
+  fs.writeFileSync(PLAYLISTS_FILE, JSON.stringify(data, null, 2));
+}
+
+function getUserPlaylists(userId) {
+  return loadPlaylists()[userId]?.playlists || {};
+}
+
+function createPlaylist(userId, username, name) {
+  const data = loadPlaylists();
+  if (!data[userId]) data[userId] = { username, playlists: {} };
+  data[userId].username = username;
+  if (data[userId].playlists[name]) return false; // already exists
+  data[userId].playlists[name] = { name, songs: [], createdAt: new Date().toISOString() };
+  savePlaylists(data);
+  return true;
+}
+
+function deletePlaylist(userId, name) {
+  const data = loadPlaylists();
+  if (!data[userId]?.playlists?.[name]) return false;
+  delete data[userId].playlists[name];
+  savePlaylists(data);
+  return true;
+}
+
+function addToPlaylist(userId, username, playlistName, song) {
+  const data = loadPlaylists();
+  if (!data[userId]?.playlists?.[playlistName]) return false;
+  const pl = data[userId].playlists[playlistName];
+  if (pl.songs.some(s => s.url === song.url)) return false; // duplicate
+  pl.songs.push({ title: song.title, uploader: song.uploader, url: song.url, duration: song.duration, thumbnail: song.thumbnail });
+  savePlaylists(data);
+  return true;
 }
 
 function logHistory(song, guildId) {
@@ -237,32 +288,25 @@ function buildIdleEmbed() {
 function buildControls(queue) {
   const playing = !!(queue && queue.currentSong);
   const bassBoost = !!(queue && queue.bassBoost);
-  const autoplay = !!(queue && queue.autoplay);
 
+  // Row 1 — Playback
   const row1 = new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId('pause').setLabel('Pause').setStyle(ButtonStyle.Secondary).setDisabled(!playing),
     new ButtonBuilder().setCustomId('skip').setLabel('Skip').setStyle(ButtonStyle.Secondary).setDisabled(!playing),
     new ButtonBuilder().setCustomId('stop').setLabel('Stop').setStyle(ButtonStyle.Danger).setDisabled(!playing),
-    new ButtonBuilder().setCustomId('favorite').setLabel('Favorite').setStyle(ButtonStyle.Primary).setDisabled(!playing),
-    new ButtonBuilder().setCustomId('server_favorites').setLabel('Server Favorites').setStyle(ButtonStyle.Success)
+    new ButtonBuilder().setCustomId('bass_boost').setLabel('Bass Boost').setStyle(bassBoost ? ButtonStyle.Primary : ButtonStyle.Secondary)
   );
+  // Row 2 — Library
   const row2 = new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId('add_to_radio').setLabel('Add to Radio').setStyle(ButtonStyle.Secondary).setDisabled(!playing),
-    new ButtonBuilder().setCustomId('community_radio').setLabel('Community Radio').setStyle(ButtonStyle.Primary),
-    new ButtonBuilder().setCustomId('view_pool').setLabel('View Pool').setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId('view_queue').setLabel('View Queue').setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder()
-      .setCustomId('bass_boost')
-      .setLabel('Bass Boost')
-      .setStyle(bassBoost ? ButtonStyle.Primary : ButtonStyle.Secondary)
+    new ButtonBuilder().setCustomId('favorite').setLabel('Favorite').setStyle(ButtonStyle.Primary).setDisabled(!playing),
+    new ButtonBuilder().setCustomId('playlists').setLabel('Playlists').setStyle(ButtonStyle.Success),
+    new ButtonBuilder().setCustomId('community_radio').setLabel('Community Radio').setStyle(ButtonStyle.Primary)
   );
+  // Row 3 — Info
   const row3 = new ActionRowBuilder().addComponents(
-    new ButtonBuilder()
-      .setCustomId('autoplay')
-      .setLabel(autoplay ? 'Autoplay: ON' : 'Autoplay: OFF')
-      .setStyle(autoplay ? ButtonStyle.Primary : ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId('view_queue').setLabel('View Queue').setStyle(ButtonStyle.Secondary),
     new ButtonBuilder().setCustomId('history').setLabel('History').setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId('help').setLabel('Help').setStyle(ButtonStyle.Secondary)
+    new ButtonBuilder().setCustomId('help').setLabel('HypeBot Guide').setStyle(ButtonStyle.Secondary)
   );
   return [row1, row2, row3];
 }
@@ -763,7 +807,7 @@ client.on('interactionCreate', async interaction => { try {
               '`/fav play <number>` — Play a saved favorite',
               '`/fav remove <number>` — Remove a saved favorite',
               '**Favorite** button — Quick-save current song',
-              '**Server Favorites** button — Browse anyone’s favorites',
+              "**Server Favorites** button — Browse anyone's favorites",
             ].join('\n'),
             inline: false,
           },
@@ -848,6 +892,48 @@ client.on('interactionCreate', async interaction => { try {
         const [removed] = favs.splice(num - 1, 1);
         setUserFavorites(interaction.user.id, interaction.user.username, favs);
         return interaction.reply({ content: `Removed **${removed.title}** from your favorites.`, ephemeral: true });
+      }
+    }
+
+    if (commandName === 'playlist') {
+      const sub = interaction.options.getSubcommand();
+
+      if (sub === 'add') {
+        if (!queue.currentSong) return interaction.reply({ content: 'Nothing is playing right now.', ephemeral: true });
+        const name = interaction.options.getString('name').trim();
+        const playlists = getUserPlaylists(interaction.user.id);
+        if (!playlists[name]) return interaction.reply({ content: `You don't have a playlist named **${name}**. Create one via the Playlists button.`, ephemeral: true });
+        const added = addToPlaylist(interaction.user.id, interaction.user.username, name, queue.currentSong);
+        if (!added) return interaction.reply({ content: `**${queue.currentSong.title}** is already in **${name}**.`, ephemeral: true });
+        return interaction.reply({ content: `Added **${queue.currentSong.title}** to **${name}**.`, ephemeral: true });
+      }
+
+      if (sub === 'list') {
+        const playlists = getUserPlaylists(interaction.user.id);
+        const entries = Object.values(playlists);
+        if (entries.length === 0) return interaction.reply({ content: 'You have no playlists. Create one via the Playlists button.', ephemeral: true });
+        const lines = entries.map((pl, i) => `**${i + 1}.** ${pl.name} — ${pl.songs.length} song(s)`).join('\n');
+        const embed = new EmbedBuilder().setColor(0x5865f2).setTitle('Your Playlists').setDescription(lines);
+        return interaction.reply({ embeds: [embed], ephemeral: true });
+      }
+
+      if (sub === 'remove') {
+        const name = interaction.options.getString('name').trim();
+        const num = interaction.options.getInteger('number');
+        const data = loadPlaylists();
+        const pl = data[interaction.user.id]?.playlists?.[name];
+        if (!pl) return interaction.reply({ content: `No playlist named **${name}** found.`, ephemeral: true });
+        if (num > pl.songs.length) return interaction.reply({ content: `Only ${pl.songs.length} song(s) in that playlist.`, ephemeral: true });
+        const [removed] = pl.songs.splice(num - 1, 1);
+        savePlaylists(data);
+        return interaction.reply({ content: `Removed **${removed.title}** from **${name}**.`, ephemeral: true });
+      }
+
+      if (sub === 'delete') {
+        const name = interaction.options.getString('name').trim();
+        const deleted = deletePlaylist(interaction.user.id, name);
+        if (!deleted) return interaction.reply({ content: `No playlist named **${name}** found.`, ephemeral: true });
+        return interaction.reply({ content: `Deleted playlist **${name}**.`, ephemeral: true });
       }
     }
   }
@@ -967,7 +1053,15 @@ client.on('interactionCreate', async interaction => { try {
 
     if (interaction.customId === 'community_radio') {
       const pool = loadRadio();
-      if (pool.length === 0) return interaction.reply({ content: 'The Community Radio pool is empty. Add songs with the Add to Radio button first.', ephemeral: true });
+      const radioControls = new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId('add_to_radio').setLabel('Add to Radio').setStyle(ButtonStyle.Secondary).setDisabled(!queue.currentSong),
+        new ButtonBuilder().setCustomId('view_pool').setLabel('View Pool').setStyle(ButtonStyle.Secondary),
+        new ButtonBuilder().setCustomId('autoplay').setLabel(queue.autoplay ? 'Autoplay: ON' : 'Autoplay: OFF').setStyle(queue.autoplay ? ButtonStyle.Primary : ButtonStyle.Secondary)
+      );
+
+      if (pool.length === 0) {
+        return interaction.reply({ content: 'The Community Radio pool is empty — add songs while something is playing.', components: [radioControls], ephemeral: true });
+      }
       const voiceChannel = interaction.member.voice.channel;
       if (!voiceChannel) return interaction.reply({ content: 'Join a voice channel first.', ephemeral: true });
 
@@ -979,9 +1073,9 @@ client.on('interactionCreate', async interaction => { try {
         await interaction.deferUpdate();
         const next = queue.radioSongs.shift();
         await playSong(interaction.guild, next);
-        return interaction.followUp({ content: `Community Radio started \u2014 **${pool.length} songs** shuffled. Any song you queue will play before the radio resumes.`, ephemeral: true });
+        return interaction.followUp({ content: `Community Radio started \u2014 **${pool.length} songs** shuffled. Any song you queue will play before the radio resumes.`, components: [radioControls], ephemeral: true });
       } else {
-        return interaction.reply({ content: `Community Radio queued \u2014 **${pool.length} songs** will play after your current queue finishes.`, ephemeral: true });
+        return interaction.reply({ content: `Community Radio queued \u2014 **${pool.length} songs** will play after your current queue finishes.`, components: [radioControls], ephemeral: true });
       }
     }
 
@@ -1043,6 +1137,57 @@ client.on('interactionCreate', async interaction => { try {
       const menu = new StringSelectMenuBuilder().setCustomId('sf_user_select').setPlaceholder('Pick a user to browse their favorites').addOptions(options);
       return interaction.reply({ content: '**Server Favorites**', components: [new ActionRowBuilder().addComponents(menu)], ephemeral: true });
     }
+
+    if (interaction.customId === 'playlists') {
+      const favData = loadFavorites();
+      const plData = loadPlaylists();
+
+      const options = [];
+
+      // Favorites playlists (one per user)
+      const usersWithFavs = Object.entries(favData).filter(([, v]) => v.songs?.length > 0);
+      const memberResults = await Promise.allSettled(usersWithFavs.map(([userId]) => interaction.guild.members.fetch(userId)));
+      usersWithFavs.forEach(([userId, val], i) => {
+        const member = memberResults[i].status === 'fulfilled' ? memberResults[i].value : null;
+        const username = member ? member.user.username : val.username;
+        options.push({ label: `${username}'s Favorites Playlist`, value: `fav_${userId}`, description: `${val.songs.length} song(s)` });
+      });
+
+      // Custom playlists
+      for (const [userId, userData] of Object.entries(plData)) {
+        for (const [, pl] of Object.entries(userData.playlists || {})) {
+          if (options.length >= 25) break;
+          options.push({ label: pl.name, value: `pl_${userId}||${pl.name}`, description: `${pl.songs.length} song(s) · by ${userData.username}` });
+        }
+      }
+
+      const components = [];
+      if (options.length > 0) {
+        const menu = new StringSelectMenuBuilder().setCustomId('playlist_select').setPlaceholder('Pick a playlist').addOptions(options.slice(0, 25));
+        components.push(new ActionRowBuilder().addComponents(menu));
+      }
+      components.push(new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId('playlist_create').setLabel('Create Playlist').setStyle(ButtonStyle.Primary),
+        new ButtonBuilder().setCustomId('server_favorites').setLabel('Server Favorites').setStyle(ButtonStyle.Success)
+      ));
+
+      return interaction.reply({ content: '**Playlists**', components, ephemeral: true });
+    }
+
+    if (interaction.customId === 'playlist_create') {
+      const modal = new ModalBuilder()
+        .setCustomId('modal_create_playlist')
+        .setTitle('Create a Playlist');
+      const nameInput = new TextInputBuilder()
+        .setCustomId('playlist_name')
+        .setLabel('Playlist Name')
+        .setStyle(TextInputStyle.Short)
+        .setPlaceholder('e.g. Late Night Vibes')
+        .setMaxLength(50)
+        .setRequired(true);
+      modal.addComponents(new ActionRowBuilder().addComponents(nameInput));
+      return interaction.showModal(modal);
+    }
   }
 
 
@@ -1052,63 +1197,81 @@ client.on('interactionCreate', async interaction => { try {
         .setTitle('HypeBot — Guide')
         .addFields(
           {
-            name: '🎵 Playback',
+            name: 'Playback',
             value: [
-              '`/play <name or URL>` — Play a song by searching by name or pasting a YouTube/SoundCloud link',
-              '`/pause` — Pause or resume the current song',
-              '`/skip` — Vote to skip (majority of voice channel must agree)',
-              '`/stop` — Stop playback and disconnect the bot',
-              '`/loop` — Toggle loop on the current song',
-              '`/volume <0-150>` — Adjust playback volume (100 = normal)',
+              '**Pause** — Pause or resume',
+              '**Skip** — Admins skip instantly. Everyone else votes (majority wins)',
+              '**Stop** — Stop playback and disconnect',
+              '**Bass Boost** — Toggle bass EQ (blue = active)',
+              '`/play <name or URL>` — Search by name or paste a YouTube/SoundCloud/Spotify link',
+              '`/pause` · `/skip` · `/stop` · `/loop` · `/volume <0-150>`',
             ].join('\n'),
             inline: false,
           },
           {
-            name: '📋 Queue',
+            name: 'Queue',
             value: [
-              '`/queue` — Show the full current queue',
-              '`/remove <number>` — Remove a song from the queue by position',
-              '**View Queue** button — See the queue with who requested each song',
+              '**View Queue** — See the full queue with requesters',
+              '`/queue` · `/remove <number>`',
             ].join('\n'),
             inline: false,
           },
           {
-            name: '♥️ Favorites',
+            name: 'Favorites',
             value: [
-              '`/fav add` — Save the current song to your favorites',
-              '`/fav list` — View your favorites (or `/fav list @user` for someone else)',
-              '`/fav play <number>` — Play a song from your favorites',
-              '`/fav remove <number>` — Remove a song from your favorites',
-              '**Favorite** button — Quick-save the current song',
-              '**Server Favorites** button — Browse and play anyone’s saved favorites',
+              '**Favorite** — Save the current song to your favorites',
+              '**Playlists → Server Favorites** — Browse and play anyone\'s saved favorites',
+              '`/fav add` · `/fav list` · `/fav play <number>` · `/fav remove <number>`',
             ].join('\n'),
             inline: false,
           },
           {
-            name: '📻 Community Radio',
+            name: 'Playlists',
             value: [
-              '**Community Radio** button — Shuffle and play the server’s shared radio pool',
-              '**Add to Radio** button — Add the current song to the radio pool',
-              '**View Pool** button — See all songs in the radio pool',
-              'Radio songs play automatically when your personal queue runs out',
+              '**Playlists** — Browse all favorites playlists and custom playlists',
+              '**Create Playlist** (inside Playlists) — Name and create your own playlist',
+              'Pick any playlist → **Play** or **Shuffle**',
+              '`/playlist add <name>` — Add current song to a playlist',
+              '`/playlist list` — See all your playlists',
+              '`/playlist remove <name> <number>` — Remove a song',
+              '`/playlist delete <name>` — Delete an entire playlist',
             ].join('\n'),
             inline: false,
           },
           {
-            name: '⚙️ Settings & Extras',
+            name: 'Community Radio',
             value: [
-              '**Bass Boost** button — Toggle bass-heavy EQ (turns blue when active)',
-              '**Autoplay** button — Auto-queue a related song when everything runs out',
-              '**History** button — See the last 10 songs played on this server',
-              '`/history` — Same as the History button',
-              '`/stats` — Top DJs and most played songs on this server',
+              '**Community Radio** — Shuffle and play the server radio pool',
+              '**Add to Radio** (inside Community Radio) — Add current song to the pool',
+              '**View Pool** (inside Community Radio) — See all songs in the pool',
+              '**Autoplay** (inside Community Radio) — Auto-queue a related song when queue empties',
+              'Radio plays automatically when your queue runs out',
+            ].join('\n'),
+            inline: false,
+          },
+          {
+            name: 'History & Stats',
+            value: [
+              '**History** — Last 10 songs played on this server',
+              '`/history` · `/stats`',
             ].join('\n'),
             inline: false,
           }
         )
-        .setFooter({ text: 'Tip: all button responses are private — only you can see them.' });
+        .setFooter({ text: 'All button responses are private — only you can see them.' });
       return interaction.reply({ embeds: [embed], ephemeral: true });
     }
+
+  // --- Modal Submissions ---
+  if (interaction.isModalSubmit()) {
+    if (interaction.customId === 'modal_create_playlist') {
+      const name = interaction.fields.getTextInputValue('playlist_name').trim();
+      if (!name) return interaction.reply({ content: 'Playlist name cannot be empty.', ephemeral: true });
+      const created = createPlaylist(interaction.user.id, interaction.user.username, name);
+      if (!created) return interaction.reply({ content: `You already have a playlist named **${name}**.`, ephemeral: true });
+      return interaction.reply({ content: `Playlist **${name}** created. While a song is playing, use \`/playlist add\` to add songs to it.`, ephemeral: true });
+    }
+  }
 
   // --- Select Menu Interactions ---
   if (interaction.isStringSelectMenu()) {
@@ -1169,6 +1332,90 @@ client.on('interactionCreate', async interaction => { try {
           description: `${song.uploader}${song.duration ? ` \u00B7 ${formatDuration(song.duration)}` : ''}`.slice(0, 100),
         })));
       return interaction.update({ content: null, embeds: [embed], components: [new ActionRowBuilder().addComponents(menu)] });
+    }
+
+    if (interaction.customId === 'playlist_select') {
+      const value = interaction.values[0];
+      let songs, title;
+
+      if (value.startsWith('fav_')) {
+        const userId = value.slice(4);
+        const data = loadFavorites();
+        const entry = data[userId];
+        if (!entry || entry.songs.length === 0) return interaction.update({ content: 'That playlist is empty.', components: [], embeds: [] });
+        let member = null;
+        try { member = await interaction.guild.members.fetch(userId); } catch {}
+        const username = member ? member.user.username : entry.username;
+        songs = entry.songs;
+        title = `${username}'s Favorites Playlist`;
+      } else {
+        // pl_userId||playlistName
+        const sep = value.slice(3).indexOf('||');
+        const userId = value.slice(3, 3 + sep);
+        const playlistName = value.slice(3 + sep + 2);
+        const data = loadPlaylists();
+        const pl = data[userId]?.playlists?.[playlistName];
+        if (!pl || pl.songs.length === 0) return interaction.update({ content: 'That playlist is empty.', components: [], embeds: [] });
+        songs = pl.songs;
+        title = pl.name;
+      }
+
+      const preview = songs.slice(0, 10).map((s, i) => `**${i + 1}.** ${s.uploader} — ${s.title}${s.duration ? ` (${formatDuration(s.duration)})` : ''}`).join('\n');
+      const embed = new EmbedBuilder()
+        .setColor(0x5865f2)
+        .setTitle(title)
+        .setDescription(preview + (songs.length > 10 ? `\n*...and ${songs.length - 10} more*` : ''))
+        .setFooter({ text: `${songs.length} song(s) total` });
+
+      const row = new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId(`playlist_play_${value}`).setLabel('Play').setStyle(ButtonStyle.Primary),
+        new ButtonBuilder().setCustomId(`playlist_shuffle_${value}`).setLabel('Shuffle').setStyle(ButtonStyle.Success)
+      );
+      return interaction.update({ content: null, embeds: [embed], components: [row] });
+    }
+
+    if (interaction.customId.startsWith('playlist_play_') || interaction.customId.startsWith('playlist_shuffle_')) {
+      const isShuffled = interaction.customId.startsWith('playlist_shuffle_');
+      const value = interaction.customId.replace(isShuffled ? 'playlist_shuffle_' : 'playlist_play_', '');
+
+      let rawSongs, title;
+      if (value.startsWith('fav_')) {
+        const userId = value.slice(4);
+        const data = loadFavorites();
+        const entry = data[userId];
+        if (!entry || entry.songs.length === 0) return interaction.update({ content: 'That playlist is empty.', components: [], embeds: [] });
+        let member = null;
+        try { member = await interaction.guild.members.fetch(userId); } catch {}
+        const username = member ? member.user.username : entry.username;
+        rawSongs = entry.songs;
+        title = `${username}'s Favorites Playlist`;
+      } else {
+        // pl_userId||playlistName
+        const sep = value.slice(3).indexOf('||');
+        const userId = value.slice(3, 3 + sep);
+        const playlistName = value.slice(3 + sep + 2);
+        const data = loadPlaylists();
+        const pl = data[userId]?.playlists?.[playlistName];
+        if (!pl || pl.songs.length === 0) return interaction.update({ content: 'That playlist is empty.', components: [], embeds: [] });
+        rawSongs = pl.songs;
+        title = pl.name;
+      }
+
+      const voiceChannel = interaction.member.voice.channel;
+      if (!voiceChannel) return interaction.update({ content: 'Join a voice channel first.', components: [], embeds: [] });
+
+      const songs = (isShuffled ? shuffle(rawSongs) : [...rawSongs]).map(s => ({ ...s, streamUrl: null, requestedBy: title }));
+      songs.forEach(s => queue.songs.push(s));
+
+      const isNew = ensurePlayer(interaction.guild, voiceChannel, interaction.channel);
+      if (isNew) {
+        await interaction.update({ content: `Loading **${title}**${isShuffled ? ' (shuffled)' : ''}...`, components: [], embeds: [] });
+        const next = queue.songs.shift();
+        await playSong(interaction.guild, next);
+        return interaction.editReply({ content: `Playing **${title}**${isShuffled ? ' (shuffled)' : ''} — **${songs.length} songs**. Now playing **${next.title}**` });
+      } else {
+        return interaction.update({ content: `Added **${title}**${isShuffled ? ' (shuffled)' : ''} — **${songs.length} songs** queued.`, components: [], embeds: [] });
+      }
     }
 
     if (interaction.customId.startsWith('sf_song_select_')) {

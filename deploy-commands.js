@@ -94,6 +94,46 @@ const commands = [
         .setMinValue(1)
       )
     ),
+  new SlashCommandBuilder()
+    .setName('playlist')
+    .setDescription('Manage your playlists')
+    .addSubcommand(sub => sub
+      .setName('add')
+      .setDescription('Add the current song to one of your playlists')
+      .addStringOption(opt => opt
+        .setName('name')
+        .setDescription('Playlist name to add to')
+        .setRequired(true)
+      )
+    )
+    .addSubcommand(sub => sub
+      .setName('list')
+      .setDescription('List all of your playlists')
+    )
+    .addSubcommand(sub => sub
+      .setName('remove')
+      .setDescription('Remove a song from a playlist')
+      .addStringOption(opt => opt
+        .setName('name')
+        .setDescription('Playlist name')
+        .setRequired(true)
+      )
+      .addIntegerOption(opt => opt
+        .setName('number')
+        .setDescription('Song position to remove')
+        .setRequired(true)
+        .setMinValue(1)
+      )
+    )
+    .addSubcommand(sub => sub
+      .setName('delete')
+      .setDescription('Delete an entire playlist')
+      .addStringOption(opt => opt
+        .setName('name')
+        .setDescription('Playlist name to delete')
+        .setRequired(true)
+      )
+    ),
 ].map(cmd => cmd.toJSON());
 
 const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
