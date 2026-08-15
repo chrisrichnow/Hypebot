@@ -485,6 +485,26 @@ function extractFailureReason(stderr) {
   return nonUrlLines[nonUrlLines.length - 1] || null;
 }
 
+function friendlyFailureReason(rawReason) {
+  if (!rawReason) return "something went wrong fetching the stream — try it again or pick a different upload.";
+  if (/403|forbidden/i.test(rawReason)) {
+    return "YouTube blocked this video (403 Forbidden). This happens most with official/Vevo music videos — try the audio version or a different upload of the same song instead.";
+  }
+  if (/404|not found/i.test(rawReason)) {
+    return "That video isn't available anymore (removed, private, or region-locked).";
+  }
+  if (/sign in to confirm|not a bot/i.test(rawReason)) {
+    return "YouTube is asking for bot verification on this video — try a different upload.";
+  }
+  if (/timed out|timeout/i.test(rawReason)) {
+    return "Connection to YouTube timed out — try again in a moment.";
+  }
+  if (/private video|members-only/i.test(rawReason)) {
+    return "That video is private or members-only.";
+  }
+  return `${rawReason} — try a different upload of the same song.`;
+}
+
 function buildAudioFilter(volume, bassBoost) {
   const vol = (volume / 100).toFixed(2);
   if (bassBoost) {
@@ -544,7 +564,7 @@ async function playSong(guild, song) {
       const reason = extractFailureReason(fullStderr) || `stream ended after ${elapsed.toFixed(1)}s (code ${code})`;
       console.error(`ffmpeg failed for ${song.title}:`, reason, '\nfull stderr tail:', fullStderr.slice(-1500));
       if (queue.textChannel) {
-        queue.textChannel.send({ content: `Playback failed for **${song.title}** (${reason.slice(0, 300)}) — skipping.` }).catch(() => {});
+        queue.textChannel.send({ content: `Couldn't play **${song.title}** — ${friendlyFailureReason(reason)}` }).catch(() => {});
       }
     }
   });
@@ -614,7 +634,7 @@ async function playNext(guild) {
     console.error('Error playing next song, skipping:', err.message);
     if (attemptedSong && queue.textChannel) {
       const label = attemptedSong.title || attemptedSong.url || 'that song';
-      queue.textChannel.send({ content: `Couldn't play **${label}** (${err.message}) — skipping.` }).catch(() => {});
+      queue.textChannel.send({ content: `Couldn't play **${label}** — ${friendlyFailureReason(err.message)}` }).catch(() => {});
     }
     queue.advancing = false;
     // Chain to next song instead of stopping
@@ -663,7 +683,7 @@ function ensurePlayer(guild, voiceChannel, textChannel) {
       if (queue.textChannel && queue.currentSong && !queue.currentSong._reported) {
         queue.currentSong._reported = true;
         const label = queue.currentSong.title || queue.currentSong.url || 'that song';
-        queue.textChannel.send({ content: `Playback broke on **${label}** (${err.message}) — skipping.` }).catch(() => {});
+        queue.textChannel.send({ content: `Couldn't play **${label}** — ${friendlyFailureReason(err.message)}` }).catch(() => {});
       }
     });
     return true;
