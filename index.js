@@ -78,7 +78,7 @@ function saveHistory(data) {
 }
 
 // --- Playlists storage ---
-// Structure: { userId: { username, playlists: { name: { name, songs: [], createdAt } } } }
+// Structure: { userId: { username, playlists: { name: { name, songs: [], createdAt, collaborators: [] } } } }
 const PLAYLISTS_FILE = path.join(DATA_DIR, 'playlists.json');
 
 function loadPlaylists() {
@@ -99,7 +99,7 @@ function createPlaylist(userId, username, name) {
   if (!data[userId]) data[userId] = { username, playlists: {} };
   data[userId].username = username;
   if (data[userId].playlists[name]) return false; // already exists
-  data[userId].playlists[name] = { name, songs: [], createdAt: new Date().toISOString() };
+  data[userId].playlists[name] = { name, songs: [], createdAt: new Date().toISOString(), collaborators: [] };
   savePlaylists(data);
   return true;
 }
@@ -112,14 +112,46 @@ function deletePlaylist(userId, name) {
   return true;
 }
 
-function addToPlaylist(userId, username, playlistName, song) {
+function addToPlaylist(callerId, ownerId, playlistName, song) {
   const data = loadPlaylists();
-  if (!data[userId]?.playlists?.[playlistName]) return false;
-  const pl = data[userId].playlists[playlistName];
-  if (pl.songs.some(s => s.url === song.url)) return false; // duplicate
+  if (!data[ownerId]?.playlists?.[playlistName]) return false;
+  const pl = data[ownerId].playlists[playlistName];
+  if (callerId !== ownerId && !(pl.collaborators || []).includes(callerId)) return false;
+  if (pl.songs.some(s => s.url === song.url)) return false;
   pl.songs.push({ title: song.title, uploader: song.uploader, url: song.url, duration: song.duration, thumbnail: song.thumbnail });
   savePlaylists(data);
   return true;
+}
+
+function getEditablePlaylists(userId) {
+  const data = loadPlaylists();
+  const results = [];
+  for (const [name, pl] of Object.entries(data[userId]?.playlists || {})) {
+    results.push({ ownerId: userId, ownerUsername: data[userId].username, name, songs: pl.songs, isOwn: true });
+  }
+  for (const [ownerId, userData] of Object.entries(data)) {
+    if (ownerId === userId) continue;
+    for (const [name, pl] of Object.entries(userData.playlists || {})) {
+      if ((pl.collaborators || []).includes(userId)) {
+        results.push({ ownerId, ownerUsername: userData.username, name, songs: pl.songs, isOwn: false });
+      }
+    }
+  }
+  return results;
+}
+
+function findEditablePlaylist(callerId, name) {
+  const data = loadPlaylists();
+  if (data[callerId]?.playlists?.[name]) return { ownerId: callerId, pl: data[callerId].playlists[name] };
+  const matches = [];
+  for (const [ownerId, userData] of Object.entries(data)) {
+    if (ownerId === callerId) continue;
+    const pl = userData.playlists?.[name];
+    if (pl && (pl.collaborators || []).includes(callerId)) matches.push({ ownerId, pl });
+  }
+  if (matches.length === 1) return matches[0];
+  if (matches.length > 1) return 'ambiguous';
+  return null;
 }
 
 function logHistory(song, guildId) {
@@ -233,6 +265,32 @@ const queues = new Map();
 // Vote skip tracking: guildId -> Set of userIds
 const skipVotes = new Map();
 
+function isPrivileged(member) {
+  return true;
+}
+
+// Weighted shuffle — higher net vote songs appear more often
+function weightedShuffle(pool) {
+  const items = pool.map(s => ({
+    song: s,
+    weight: Math.max(1, 1 + (s.upvotes?.length || 0) - (s.downvotes?.length || 0)),
+  }));
+  const result = [];
+  const remaining = [...items];
+  while (remaining.length > 0) {
+    const total = remaining.reduce((sum, x) => sum + x.weight, 0);
+    let r = Math.random() * total;
+    let picked = remaining.length - 1;
+    for (let i = 0; i < remaining.length; i++) {
+      r -= remaining[i].weight;
+      if (r <= 0) { picked = i; break; }
+    }
+    result.push(remaining[picked].song);
+    remaining.splice(picked, 1);
+  }
+  return result;
+}
+
 function getQueue(guildId) {
   if (!queues.has(guildId)) {
     queues.set(guildId, {
@@ -250,6 +308,7 @@ function getQueue(guildId) {
       bassBoost: false,
       autoplay: false,
       advancing: false,
+      startedAt: null,
     });
   }
   return queues.get(guildId);
@@ -262,11 +321,22 @@ function formatDuration(seconds) {
   return `${m}m ${s}s`;
 }
 
+function buildProgressBar(startedAt, duration, width = 16) {
+  if (!startedAt || !duration) return '';
+  const elapsed = Math.min((Date.now() - startedAt) / 1000, duration);
+  const pct = elapsed / duration;
+  const filled = Math.round(pct * width);
+  const bar = '█'.repeat(filled) + '░'.repeat(width - filled);
+  return `\`${bar}\` ${formatDuration(Math.floor(elapsed))} / ${formatDuration(duration)}`;
+}
+
 function buildNowPlayingEmbed(song, queue) {
+  const progressBar = buildProgressBar(queue.startedAt, song.duration);
+  const desc = `**${song.uploader}** - **[${song.title}](${song.url})**` + (progressBar ? `\n${progressBar}` : '');
   return new EmbedBuilder()
     .setColor(0x5865f2)
     .setTitle('Now Playing')
-    .setDescription(`**${song.uploader}** - **[${song.title}](${song.url})** - ${formatDuration(song.duration)}`)
+    .setDescription(desc)
     .addFields(
       { name: 'Channel', value: queue.voiceChannelId ? `<#${queue.voiceChannelId}>` : '\u2014', inline: true },
       { name: 'Queue', value: `${queue.songs.length + queue.radioSongs.length} song(s) in queue${queue.radioSongs.length > 0 ? ` (${queue.radioSongs.length} radio)` : ''}`, inline: true },
@@ -299,12 +369,15 @@ function buildControls(queue) {
   // Row 2 — Library
   const row2 = new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId('favorite').setLabel('Favorite').setStyle(ButtonStyle.Primary).setDisabled(!playing),
+    new ButtonBuilder().setCustomId('add_to_playlist_hub').setLabel('Add to Playlist').setStyle(ButtonStyle.Success).setDisabled(!playing),
+    new ButtonBuilder().setCustomId('add_to_radio').setLabel('Add to Radio').setStyle(ButtonStyle.Secondary).setDisabled(!playing),
     new ButtonBuilder().setCustomId('playlists').setLabel('Playlists').setStyle(ButtonStyle.Success),
     new ButtonBuilder().setCustomId('community_radio').setLabel('Community Radio').setStyle(ButtonStyle.Primary)
   );
   // Row 3 — Info
   const row3 = new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId('view_queue').setLabel('View Queue').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId('clear_queue').setLabel('Clear Queue').setStyle(ButtonStyle.Danger).setDisabled(!playing),
     new ButtonBuilder().setCustomId('history').setLabel('History').setStyle(ButtonStyle.Secondary),
     new ButtonBuilder().setCustomId('help').setLabel('HypeBot Guide').setStyle(ButtonStyle.Secondary)
   );
@@ -327,13 +400,31 @@ async function updateHub(guild) {
   queue.hubMessage = await queue.textChannel.send(payload);
 }
 
+// Edit the hub in place — used by progress bar timer to avoid constant delete/resend
+async function editHub(guild) {
+  const queue = getQueue(guild.id);
+  if (!queue.textChannel || !queue.hubMessage) return;
+  const isPlaying = !!queue.currentSong;
+  const embed = isPlaying ? buildNowPlayingEmbed(queue.currentSong, queue) : buildIdleEmbed();
+  try {
+    await queue.hubMessage.edit({ embeds: [embed], components: buildControls(queue), content: null });
+  } catch {
+    await updateHub(guild);
+  }
+}
+
 function getPlaylistEntries(url) {
   return new Promise((resolve, reject) => {
     const proc = spawn('yt-dlp', ['--flat-playlist', '--dump-json', url]);
     let data = '';
+    let stderr = '';
     proc.stdout.on('data', chunk => (data += chunk));
+    proc.stderr.on('data', chunk => (stderr += chunk));
     proc.on('close', code => {
-      if (code !== 0) return reject(new Error('Could not fetch info'));
+      if (code !== 0) {
+        console.error(`yt-dlp failed (code ${code}) for ${url}:`, stderr.trim().slice(-500));
+        return reject(new Error('Could not fetch info'));
+      }
       try {
         const entries = data.trim().split('\n').filter(Boolean).map(line => {
           const info = JSON.parse(line);
@@ -349,7 +440,6 @@ function getPlaylistEntries(url) {
         resolve(entries);
       } catch (e) { reject(e); }
     });
-    proc.stderr.on('data', () => {});
   });
 }
 
@@ -357,9 +447,12 @@ function getSongInfo(url, attempt = 0) {
   return new Promise((resolve, reject) => {
     const proc = spawn('yt-dlp', ['--dump-json', '--no-playlist', '-f', 'bestaudio/best', url]);
     let data = '';
+    let stderr = '';
     proc.stdout.on('data', chunk => (data += chunk));
+    proc.stderr.on('data', chunk => (stderr += chunk));
     proc.on('close', code => {
       if (code !== 0) {
+        console.error(`yt-dlp failed (code ${code}, attempt ${attempt}) for ${url}:`, stderr.trim().slice(-500));
         if (attempt < 2) {
           setTimeout(() => getSongInfo(url, attempt + 1).then(resolve).catch(reject), 1000);
         } else {
@@ -376,11 +469,20 @@ function getSongInfo(url, attempt = 0) {
           thumbnail: info.thumbnail,
           url,
           streamUrl: info.url,
+          streamHeaders: info.http_headers || null,
         });
       } catch (e) { reject(e); }
     });
-    proc.stderr.on('data', () => {});
   });
+}
+
+function extractFailureReason(stderr) {
+  const lines = stderr.split('\n').map(l => l.trim().replace(/^https?:\/\/\S+?:\s*/, '')).filter(Boolean);
+  const errorKeywords = /error|forbidden|403|404|denied|refused|timed out|invalid data|reset by peer|no route|unable to|failed|aborting/i;
+  const matches = lines.filter(l => errorKeywords.test(l));
+  if (matches.length > 0) return matches[matches.length - 1];
+  const nonUrlLines = lines.filter(l => !/^https?:\/\//.test(l));
+  return nonUrlLines[nonUrlLines.length - 1] || null;
 }
 
 function buildAudioFilter(volume, bassBoost) {
@@ -391,18 +493,31 @@ function buildAudioFilter(volume, bassBoost) {
   return `volume=${vol}`;
 }
 
-function createStream(streamUrl, volume, bassBoost) {
+function createStream(streamUrl, volume, bassBoost, streamHeaders) {
   const filter = buildAudioFilter(volume != null ? volume : 100, bassBoost || false);
-  const ffmpeg = spawn('ffmpeg', [
+  const args = [
     '-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '5',
     '-reconnect_on_http_error', '4xx,5xx',
     '-timeout', '15000000',
     '-probesize', '32', '-analyzeduration', '0',
+  ];
+  if (streamHeaders) {
+    const headerLines = Object.entries(streamHeaders).map(([k, v]) => `${k}: ${v}`).join('\r\n') + '\r\n';
+    args.push('-headers', headerLines);
+  }
+  args.push(
     '-i', streamUrl,
     '-filter:a', filter,
     '-c:a', 'libopus', '-b:a', '192k', '-vbr', 'on', '-f', 'ogg', 'pipe:1'
-  ], { stdio: ['ignore', 'pipe', 'ignore'] });
-  return createAudioResource(ffmpeg.stdout, { inputType: StreamType.OggOpus });
+  );
+  const ffmpeg = spawn('ffmpeg', args, { stdio: ['ignore', 'pipe', 'pipe'] });
+  let stderr = '';
+  ffmpeg.stderr.on('data', chunk => {
+    stderr += chunk;
+    if (stderr.length > 4000) stderr = stderr.slice(-4000);
+  });
+  const resource = createAudioResource(ffmpeg.stdout, { inputType: StreamType.OggOpus });
+  return { resource, ffmpeg, getStderr: () => stderr };
 }
 
 async function playSong(guild, song) {
@@ -412,9 +527,28 @@ async function playSong(guild, song) {
     Object.assign(song, info);
   }
   queue.currentSong = song;
+  queue.startedAt = Date.now();
   // Clear skip votes for new song
   skipVotes.set(guild.id, new Set());
-  queue.player.play(createStream(song.streamUrl, queue.volume, queue.bassBoost));
+  const { resource, ffmpeg, getStderr } = createStream(song.streamUrl, queue.volume, queue.bassBoost, song.streamHeaders);
+  queue.currentFfmpeg = ffmpeg;
+  song._reported = false;
+  ffmpeg.on('close', code => {
+    if (queue.currentFfmpeg !== ffmpeg || song._reported) return;
+    const elapsed = (Date.now() - queue.startedAt) / 1000;
+    const expected = song.duration || 0;
+    const suspiciouslyShort = expected > 20 && elapsed < Math.min(15, expected * 0.5);
+    if (code !== 0 || suspiciouslyShort) {
+      song._reported = true;
+      const fullStderr = getStderr();
+      const reason = extractFailureReason(fullStderr) || `stream ended after ${elapsed.toFixed(1)}s (code ${code})`;
+      console.error(`ffmpeg failed for ${song.title}:`, reason, '\nfull stderr tail:', fullStderr.slice(-1500));
+      if (queue.textChannel) {
+        queue.textChannel.send({ content: `Playback failed for **${song.title}** (${reason.slice(0, 300)}) — skipping.` }).catch(() => {});
+      }
+    }
+  });
+  queue.player.play(resource);
   logHistory(song, guild.id);
   await updateHub(guild);
 }
@@ -439,11 +573,14 @@ async function playNext(guild) {
   const queue = getQueue(guild.id);
   if (!queue.player || queue.advancing) return;
   queue.advancing = true;
+  let attemptedSong = null;
   try {
     if (queue.loop && queue.currentSong) {
       if (queue.currentSong.url?.includes('soundcloud.com')) {
         queue.currentSong.streamUrl = null;
+        queue.currentSong.streamHeaders = null;
       }
+      attemptedSong = queue.currentSong;
       await playSong(guild, queue.currentSong);
       return;
     }
@@ -453,6 +590,7 @@ async function playNext(guild) {
                : null;
 
     if (next) {
+      attemptedSong = next;
       await playSong(guild, next);
       return;
     }
@@ -460,6 +598,7 @@ async function playNext(guild) {
     // Nothing queued — try autoplay
     const didAutoplay = await tryAutoplay(guild);
     if (didAutoplay && queue.songs.length > 0) {
+      attemptedSong = queue.songs[0];
       await playSong(guild, queue.songs.shift());
       return;
     }
@@ -473,6 +612,10 @@ async function playNext(guild) {
     updateHub(guild);
   } catch (err) {
     console.error('Error playing next song, skipping:', err.message);
+    if (attemptedSong && queue.textChannel) {
+      const label = attemptedSong.title || attemptedSong.url || 'that song';
+      queue.textChannel.send({ content: `Couldn't play **${label}** (${err.message}) — skipping.` }).catch(() => {});
+    }
     queue.advancing = false;
     // Chain to next song instead of stopping
     if (queue.songs.length > 0 || queue.radioSongs.length > 0) {
@@ -515,6 +658,12 @@ function ensurePlayer(guild, voiceChannel, textChannel) {
       // Clear cached stream URL on error — SoundCloud CDN URLs expire quickly
       if (queue.currentSong?.url?.includes('soundcloud.com')) {
         queue.currentSong.streamUrl = null;
+        queue.currentSong.streamHeaders = null;
+      }
+      if (queue.textChannel && queue.currentSong && !queue.currentSong._reported) {
+        queue.currentSong._reported = true;
+        const label = queue.currentSong.title || queue.currentSong.url || 'that song';
+        queue.textChannel.send({ content: `Playback broke on **${label}** (${err.message}) — skipping.` }).catch(() => {});
       }
     });
     return true;
@@ -556,6 +705,15 @@ client.once('ready', async () => {
     }
   }
 });
+
+// Progress bar timer — edit hub in place every 20s while something is playing
+setInterval(async () => {
+  for (const [, queue] of queues) {
+    if (queue.currentSong && queue.hubMessage && queue.startedAt && queue.guild) {
+      try { await editHub(queue.guild); } catch {}
+    }
+  }
+}, 20000);
 
 client.on('interactionCreate', async interaction => { try {
 
@@ -660,6 +818,7 @@ client.on('interactionCreate', async interaction => { try {
     }
 
     if (commandName === 'stop') {
+      if (!isPrivileged(interaction.member)) return interaction.reply({ content: 'Only DJs, admins, and the server owner can stop the bot.', ephemeral: true });
       if (!queue.connection) return interaction.reply({ content: 'Not connected.', ephemeral: true });
       queue.songs = [];
       queue.radioSongs = [];
@@ -701,11 +860,36 @@ client.on('interactionCreate', async interaction => { try {
     }
 
     if (commandName === 'remove') {
+      if (!isPrivileged(interaction.member)) return interaction.reply({ content: 'Only DJs, admins, and the server owner can remove songs.', ephemeral: true });
       const pos = interaction.options.getInteger('number');
       if (queue.songs.length === 0) return interaction.reply({ content: 'The queue is empty.', ephemeral: true });
       if (pos > queue.songs.length) return interaction.reply({ content: `Only ${queue.songs.length} song(s) in the queue.`, ephemeral: true });
       const [removed] = queue.songs.splice(pos - 1, 1);
       return interaction.reply({ content: `Removed **${removed.title}** from position ${pos}.`, ephemeral: true });
+    }
+
+    if (commandName === 'purge') {
+      if (!isPrivileged(interaction.member)) return interaction.reply({ content: 'Only DJs, admins, and the server owner can purge the queue.', ephemeral: true });
+      if (queue.songs.length === 0) return interaction.reply({ content: 'The queue is empty.', ephemeral: true });
+      const start = interaction.options.getInteger('start');
+      const end = interaction.options.getInteger('end') ?? queue.songs.length;
+      if (start > queue.songs.length) return interaction.reply({ content: `Only ${queue.songs.length} song(s) in the queue.`, ephemeral: true });
+      const clampedEnd = Math.min(end, queue.songs.length);
+      if (start > clampedEnd) return interaction.reply({ content: 'Start position must be less than or equal to end position.', ephemeral: true });
+      const removed = queue.songs.splice(start - 1, clampedEnd - start + 1);
+      return interaction.reply({ content: `Removed **${removed.length}** song(s) from position ${start}${clampedEnd !== start ? `–${clampedEnd}` : ''}. ${queue.songs.length} song(s) remaining.`, ephemeral: true });
+    }
+
+    if (commandName === 'move') {
+      if (!isPrivileged(interaction.member)) return interaction.reply({ content: 'Only DJs, admins, and the server owner can move songs.', ephemeral: true });
+      if (queue.songs.length < 2) return interaction.reply({ content: 'Need at least 2 songs in the queue to move.', ephemeral: true });
+      const from = interaction.options.getInteger('from');
+      const to = interaction.options.getInteger('to');
+      if (from > queue.songs.length || to > queue.songs.length) return interaction.reply({ content: `Only ${queue.songs.length} song(s) in the queue.`, ephemeral: true });
+      if (from === to) return interaction.reply({ content: 'That song is already in that position.', ephemeral: true });
+      const [song] = queue.songs.splice(from - 1, 1);
+      queue.songs.splice(to - 1, 0, song);
+      return interaction.reply({ content: `Moved **${song.title}** from position ${from} to ${to}.`, ephemeral: true });
     }
 
     if (commandName === 'volume') {
@@ -731,7 +915,15 @@ client.on('interactionCreate', async interaction => { try {
         .setColor(0x5865f2)
         .setTitle('Recently Played')
         .setDescription(lines.join('\u000A').slice(0, 4096));
-      return interaction.reply({ embeds: [embed], ephemeral: true });
+      const histOptions = last10.map((h, i) => ({
+        label: `${h.uploader} — ${h.title}`.slice(0, 100),
+        value: String(i),
+        description: new Date(h.timestamp).toLocaleDateString(),
+      }));
+      const histComponents = [new ActionRowBuilder().addComponents(
+        new StringSelectMenuBuilder().setCustomId('hist_add_song_select').setPlaceholder('Add a song to one of your playlists...').addOptions(histOptions)
+      )];
+      return interaction.reply({ embeds: [embed], components: histComponents, ephemeral: true });
     }
 
     if (commandName === 'stats') {
@@ -795,7 +987,9 @@ client.on('interactionCreate', async interaction => { try {
             value: [
               '`/queue` — Show the full queue',
               '`/remove <number>` — Remove a song by position',
+              '`/purge <start> [end]` — Remove a range of songs (e.g. `/purge 5 200`). Omit end to clear everything from that position onward.',
               '**View Queue** button — See queue with who requested each song',
+              '**Clear Queue** button — Wipe the entire queue (currently playing song is unaffected)',
             ].join('\n'),
             inline: false,
           },
@@ -855,7 +1049,15 @@ client.on('interactionCreate', async interaction => { try {
         if (favs.length === 0) return interaction.reply({ content: `${target.id === interaction.user.id ? 'You have' : `**${target.username}** has`} no favorites yet.`, ephemeral: true });
         const list = favs.map((f, i) => `**${i + 1}.** ${f.uploader} \u2014 [${f.title}](${f.url}) ${f.duration ? `(${formatDuration(f.duration)})` : ''}`).join('\u000A');
         const embed = new EmbedBuilder().setColor(0x5865f2).setTitle(`${target.username}'s Favorites`).setDescription(list.slice(0, 4096));
-        return interaction.reply({ embeds: [embed], ephemeral: true });
+        const favAddOptions = favs.slice(0, 25).map((f, i) => ({
+          label: `${f.uploader} — ${f.title}`.slice(0, 100),
+          value: `${target.id}||${i}`,
+          description: f.duration ? formatDuration(f.duration) : undefined,
+        }));
+        const favComponents = [new ActionRowBuilder().addComponents(
+          new StringSelectMenuBuilder().setCustomId('fav_to_pl_song_select').setPlaceholder('Add a favorite to one of your playlists...').addOptions(favAddOptions)
+        )];
+        return interaction.reply({ embeds: [embed], components: favComponents, ephemeral: true });
       }
 
       if (sub === 'play') {
@@ -899,30 +1101,86 @@ client.on('interactionCreate', async interaction => { try {
       const sub = interaction.options.getSubcommand();
 
       if (sub === 'add') {
-        if (!queue.currentSong) return interaction.reply({ content: 'Nothing is playing right now.', ephemeral: true });
         const name = interaction.options.getString('name').trim();
-        const playlists = getUserPlaylists(interaction.user.id);
-        if (!playlists[name]) return interaction.reply({ content: `You don't have a playlist named **${name}**. Create one via the Playlists button.`, ephemeral: true });
-        const added = addToPlaylist(interaction.user.id, interaction.user.username, name, queue.currentSong);
-        if (!added) return interaction.reply({ content: `**${queue.currentSong.title}** is already in **${name}**.`, ephemeral: true });
-        return interaction.reply({ content: `Added **${queue.currentSong.title}** to **${name}**.`, ephemeral: true });
+        const songInput = interaction.options.getString('song');
+        const found = findEditablePlaylist(interaction.user.id, name);
+        if (!found) return interaction.reply({ content: `No playlist named **${name}** found that you can edit. Create one via the Playlists button.`, ephemeral: true });
+        if (found === 'ambiguous') return interaction.reply({ content: `Multiple playlists named **${name}** exist that you can edit. Use the Add to Playlist button to pick the right one.`, ephemeral: true });
+        const { ownerId } = found;
+
+        if (!songInput) {
+          if (!queue.currentSong) return interaction.reply({ content: 'Nothing is playing right now. Use `/playlist add <name> <song or URL>` to add any song directly.', ephemeral: true });
+          const added = addToPlaylist(interaction.user.id, ownerId, name, queue.currentSong);
+          if (!added) return interaction.reply({ content: `**${queue.currentSong.title}** is already in **${name}**.`, ephemeral: true });
+          return interaction.reply({ content: `Added **${queue.currentSong.title}** to **${name}**.`, ephemeral: true });
+        }
+
+        await interaction.deferReply({ ephemeral: true });
+        try {
+          let songInfo;
+          if (isUrl(songInput)) {
+            songInfo = await getSongInfo(songInput);
+          } else {
+            const results = await getPlaylistEntries(`ytsearch1:${songInput}`);
+            if (!results.length) return interaction.editReply({ content: 'No results found.' });
+            songInfo = results[0];
+          }
+          const song = { title: songInfo.title, uploader: songInfo.uploader, url: songInfo.url, duration: songInfo.duration, thumbnail: songInfo.thumbnail };
+          const added = addToPlaylist(interaction.user.id, ownerId, name, song);
+          if (!added) return interaction.editReply({ content: `**${song.title}** is already in **${name}**.` });
+          return interaction.editReply({ content: `Added **${song.title}** to **${name}**.` });
+        } catch (err) {
+          console.error(err);
+          return interaction.editReply({ content: 'Could not find that song. Try a different search or paste a direct URL.' });
+        }
+      }
+
+      if (sub === 'save') {
+        const name = interaction.options.getString('name').trim();
+        const allSongs = [];
+        if (queue.currentSong) allSongs.push(queue.currentSong);
+        allSongs.push(...queue.songs);
+        if (allSongs.length === 0) return interaction.reply({ content: 'Nothing is playing or queued right now.', ephemeral: true });
+
+        const data = loadPlaylists();
+        if (!data[interaction.user.id]) data[interaction.user.id] = { username: interaction.user.username, playlists: {} };
+        data[interaction.user.id].username = interaction.user.username;
+        const isNew = !data[interaction.user.id].playlists[name];
+        if (isNew) data[interaction.user.id].playlists[name] = { name, songs: [], createdAt: new Date().toISOString() };
+
+        const pl = data[interaction.user.id].playlists[name];
+        let added = 0, skipped = 0;
+        for (const song of allSongs) {
+          if (pl.songs.some(s => s.url === song.url)) { skipped++; continue; }
+          pl.songs.push({ title: song.title, uploader: song.uploader, url: song.url, duration: song.duration, thumbnail: song.thumbnail });
+          added++;
+        }
+        savePlaylists(data);
+        const action = isNew ? `Created **${name}**` : `Updated **${name}**`;
+        const skippedNote = skipped > 0 ? ` (${skipped} duplicate(s) skipped)` : '';
+        return interaction.reply({ content: `${action} — added **${added}** song(s)${skippedNote}. Playlist now has **${pl.songs.length}** song(s).`, ephemeral: true });
       }
 
       if (sub === 'list') {
-        const playlists = getUserPlaylists(interaction.user.id);
-        const entries = Object.values(playlists);
-        if (entries.length === 0) return interaction.reply({ content: 'You have no playlists. Create one via the Playlists button.', ephemeral: true });
-        const lines = entries.map((pl, i) => `**${i + 1}.** ${pl.name} — ${pl.songs.length} song(s)`).join('\n');
-        const embed = new EmbedBuilder().setColor(0x5865f2).setTitle('Your Playlists').setDescription(lines);
+        const editable = getEditablePlaylists(interaction.user.id);
+        if (editable.length === 0) return interaction.reply({ content: 'You have no playlists. Create one via the Playlists button.', ephemeral: true });
+        const ownLines = editable.filter(e => e.isOwn).map((e, i) => `**${i + 1}.** ${e.name} — ${e.songs.length} song(s)`);
+        const collabLines = editable.filter(e => !e.isOwn).map(e => `• ${e.ownerUsername}: ${e.name} — ${e.songs.length} song(s)`);
+        let desc = '';
+        if (ownLines.length) desc += '**Your Playlists**\n' + ownLines.join('\n');
+        if (collabLines.length) desc += (desc ? '\n\n' : '') + '**Shared With You**\n' + collabLines.join('\n');
+        const embed = new EmbedBuilder().setColor(0x5865f2).setTitle('Playlists').setDescription(desc);
         return interaction.reply({ embeds: [embed], ephemeral: true });
       }
 
       if (sub === 'remove') {
         const name = interaction.options.getString('name').trim();
         const num = interaction.options.getInteger('number');
+        const foundR = findEditablePlaylist(interaction.user.id, name);
+        if (!foundR) return interaction.reply({ content: `No playlist named **${name}** found that you can edit.`, ephemeral: true });
+        if (foundR === 'ambiguous') return interaction.reply({ content: `Multiple playlists named **${name}** exist that you can edit. Use a more specific name.`, ephemeral: true });
         const data = loadPlaylists();
-        const pl = data[interaction.user.id]?.playlists?.[name];
-        if (!pl) return interaction.reply({ content: `No playlist named **${name}** found.`, ephemeral: true });
+        const pl = data[foundR.ownerId]?.playlists?.[name];
         if (num > pl.songs.length) return interaction.reply({ content: `Only ${pl.songs.length} song(s) in that playlist.`, ephemeral: true });
         const [removed] = pl.songs.splice(num - 1, 1);
         savePlaylists(data);
@@ -934,6 +1192,33 @@ client.on('interactionCreate', async interaction => { try {
         const deleted = deletePlaylist(interaction.user.id, name);
         if (!deleted) return interaction.reply({ content: `No playlist named **${name}** found.`, ephemeral: true });
         return interaction.reply({ content: `Deleted playlist **${name}**.`, ephemeral: true });
+      }
+
+      if (sub === 'invite') {
+        const name = interaction.options.getString('name').trim();
+        const target = interaction.options.getUser('user');
+        if (target.id === interaction.user.id) return interaction.reply({ content: 'That\'s you — you already own that playlist.', ephemeral: true });
+        const data = loadPlaylists();
+        const pl = data[interaction.user.id]?.playlists?.[name];
+        if (!pl) return interaction.reply({ content: `You don't have a playlist named **${name}**.`, ephemeral: true });
+        if (!pl.collaborators) pl.collaborators = [];
+        if (pl.collaborators.includes(target.id)) return interaction.reply({ content: `**${target.username}** already has access to **${name}**.`, ephemeral: true });
+        pl.collaborators.push(target.id);
+        savePlaylists(data);
+        return interaction.reply({ content: `**${target.username}** can now add and remove songs from your playlist **${name}**.` });
+      }
+
+      if (sub === 'revoke') {
+        const name = interaction.options.getString('name').trim();
+        const target = interaction.options.getUser('user');
+        const data = loadPlaylists();
+        const pl = data[interaction.user.id]?.playlists?.[name];
+        if (!pl) return interaction.reply({ content: `You don't have a playlist named **${name}**.`, ephemeral: true });
+        const idx = (pl.collaborators || []).indexOf(target.id);
+        if (idx === -1) return interaction.reply({ content: `**${target.username}** doesn't have access to **${name}**.`, ephemeral: true });
+        pl.collaborators.splice(idx, 1);
+        savePlaylists(data);
+        return interaction.reply({ content: `Removed **${target.username}**'s access to **${name}**.`, ephemeral: true });
       }
     }
   }
@@ -955,8 +1240,8 @@ client.on('interactionCreate', async interaction => { try {
     if (interaction.customId === 'skip') {
       if (!queue.player) return interaction.reply({ content: 'Nothing is playing.', ephemeral: true });
 
-      // Admins skip instantly
-      if (interaction.member.permissions.has('Administrator')) {
+      // Owner, admins, or DJs skip instantly
+      if (isPrivileged(interaction.member)) {
         skipVotes.set(interaction.guild.id, new Set());
         queue.player.stop();
         return interaction.reply({ content: 'Skipped.', ephemeral: true });
@@ -987,6 +1272,7 @@ client.on('interactionCreate', async interaction => { try {
     }
 
     if (interaction.customId === 'stop') {
+      if (!isPrivileged(interaction.member)) return interaction.reply({ content: 'Only DJs, admins, and the server owner can stop the bot.', ephemeral: true });
       if (!queue.connection) return interaction.reply({ content: 'Not connected.', ephemeral: true });
       queue.songs = [];
       queue.radioSongs = [];
@@ -1038,51 +1324,83 @@ client.on('interactionCreate', async interaction => { try {
         .setColor(0x5865f2)
         .setTitle('Recently Played')
         .setDescription(lines.join('\u000A').slice(0, 4096));
-      return interaction.reply({ embeds: [embed], ephemeral: true });
+      const histOptions = last10.map((h, i) => ({
+        label: `${h.uploader} — ${h.title}`.slice(0, 100),
+        value: String(i),
+        description: new Date(h.timestamp).toLocaleDateString(),
+      }));
+      const histComponents = [new ActionRowBuilder().addComponents(
+        new StringSelectMenuBuilder().setCustomId('hist_add_song_select').setPlaceholder('Add a song to one of your playlists...').addOptions(histOptions)
+      )];
+      return interaction.reply({ embeds: [embed], components: histComponents, ephemeral: true });
     }
 
     if (interaction.customId === 'add_to_radio') {
       if (!queue.currentSong) return interaction.reply({ content: 'Nothing is playing right now.', ephemeral: true });
       const pool = loadRadio();
-      const song = queue.currentSong;
-      if (pool.some(s => s.url === song.url)) return interaction.reply({ content: `**${song.title}** is already in the Community Radio pool.`, ephemeral: true });
-      pool.push({ title: song.title, uploader: song.uploader, url: song.url, duration: song.duration, thumbnail: song.thumbnail, addedBy: interaction.user.username });
-      saveRadio(pool);
-      return interaction.reply({ content: `Added **${song.title}** to Community Radio. Pool is now **${pool.length} song(s)**.`, ephemeral: true });
+      if (pool.some(s => s.url === queue.currentSong.url)) return interaction.reply({ content: `**${queue.currentSong.title}** is already in the Community Radio pool.`, ephemeral: true });
+      const modal = new ModalBuilder().setCustomId('modal_add_to_radio').setTitle('Add to Community Radio');
+      const genreInput = new TextInputBuilder()
+        .setCustomId('radio_genre')
+        .setLabel('Genre tag (optional)')
+        .setStyle(TextInputStyle.Short)
+        .setPlaceholder('e.g. Rap, Chill, House — leave blank for Untagged')
+        .setRequired(false)
+        .setMaxLength(30);
+      modal.addComponents(new ActionRowBuilder().addComponents(genreInput));
+      return interaction.showModal(modal);
     }
 
     if (interaction.customId === 'community_radio') {
       const pool = loadRadio();
-      const radioControls = new ActionRowBuilder().addComponents(
-        new ButtonBuilder().setCustomId('add_to_radio').setLabel('Add to Radio').setStyle(ButtonStyle.Secondary).setDisabled(!queue.currentSong),
-        new ButtonBuilder().setCustomId('view_pool').setLabel('View Pool').setStyle(ButtonStyle.Secondary),
-        new ButtonBuilder().setCustomId('autoplay').setLabel(queue.autoplay ? 'Autoplay: ON' : 'Autoplay: OFF').setStyle(queue.autoplay ? ButtonStyle.Primary : ButtonStyle.Secondary)
-      );
-
       if (pool.length === 0) {
-        return interaction.reply({ content: 'The Community Radio pool is empty — add songs while something is playing.', components: [radioControls], ephemeral: true });
+        return interaction.reply({ content: 'The Community Radio pool is empty — add songs while something is playing.', ephemeral: true });
       }
       const voiceChannel = interaction.member.voice.channel;
       if (!voiceChannel) return interaction.reply({ content: 'Join a voice channel first.', ephemeral: true });
 
-      const shuffled = shuffle(pool);
-      queue.radioSongs = shuffled.map(s => ({ ...s, streamUrl: null, requestedBy: 'Community Radio' }));
+      // If any songs have genre tags, show a genre filter first
+      const genres = [...new Set(pool.map(s => s.genre).filter(Boolean))];
+      if (genres.length > 0) {
+        const options = [
+          { label: 'All Genres', value: 'all', description: `${pool.length} songs` },
+          ...genres.map(g => ({
+            label: g,
+            value: g,
+            description: `${pool.filter(s => s.genre === g).length} songs`,
+          })),
+        ];
+        const menu = new StringSelectMenuBuilder()
+          .setCustomId('radio_genre_select')
+          .setPlaceholder('Filter by genre (or pick All Genres)')
+          .addOptions(options.slice(0, 25));
+        return interaction.reply({ content: '**Community Radio** — pick a genre to play:', components: [new ActionRowBuilder().addComponents(menu)], ephemeral: true });
+      }
 
+      // No genres — start immediately with weighted shuffle
+      const shuffled = weightedShuffle(pool);
+      queue.radioSongs = shuffled.map(s => ({ ...s, streamUrl: null, requestedBy: 'Community Radio' }));
       const isNew = ensurePlayer(interaction.guild, voiceChannel, interaction.channel);
       if (isNew) {
         await interaction.deferUpdate();
         const next = queue.radioSongs.shift();
         await playSong(interaction.guild, next);
-        return interaction.followUp({ content: `Community Radio started \u2014 **${pool.length} songs** shuffled. Any song you queue will play before the radio resumes.`, components: [radioControls], ephemeral: true });
+        return interaction.followUp({ content: `Community Radio started \u2014 **${pool.length} songs** shuffled. Any song you queue will play before the radio resumes.`, ephemeral: true });
       } else {
-        return interaction.reply({ content: `Community Radio queued \u2014 **${pool.length} songs** will play after your current queue finishes.`, components: [radioControls], ephemeral: true });
+        return interaction.reply({ content: `Community Radio queued \u2014 **${pool.length} songs** will play after your current queue finishes.`, ephemeral: true });
       }
     }
 
     if (interaction.customId === 'view_pool') {
       const pool = loadRadio();
       if (pool.length === 0) return interaction.reply({ content: 'The Community Radio pool is empty. Add songs while music is playing using the Add to Radio button.', ephemeral: true });
-      const lines = pool.map((s, i) => `**${i + 1}.** ${s.uploader} \u2014 ${s.title}${s.duration ? ` (${formatDuration(s.duration)})` : ''} \u00B7 *added by ${s.addedBy}*`);
+      const lines = pool.map((s, i) => {
+        const up = s.upvotes?.length || 0;
+        const down = s.downvotes?.length || 0;
+        const votes = up > 0 || down > 0 ? ` · +${up}/-${down}` : '';
+        const genre = s.genre ? ` · [${s.genre}]` : '';
+        return `**${i + 1}.** ${s.uploader} \u2014 ${s.title}${s.duration ? ` (${formatDuration(s.duration)})` : ''}${votes}${genre} \u00B7 *${s.addedBy}*`;
+      });
       let description = '';
       for (const line of lines) {
         if ((description + '\u000A' + line).length > 4000) { description += `\u000A*...and ${pool.length - lines.indexOf(line)} more*`; break; }
@@ -1092,7 +1410,24 @@ client.on('interactionCreate', async interaction => { try {
         .setColor(0x5865f2)
         .setTitle(`Community Radio Pool \u2014 ${pool.length} song(s)`)
         .setDescription(description);
-      return interaction.reply({ embeds: [embed], ephemeral: true });
+
+      const songOptions = pool.slice(0, 25).map((s, i) => ({
+        label: `${i + 1}. ${s.title}`.slice(0, 100),
+        value: String(i),
+        description: `Added by ${s.addedBy}`.slice(0, 100),
+      }));
+      const removeMenu = new StringSelectMenuBuilder().setCustomId('radio_remove_select').setPlaceholder('Remove a song...').addOptions(songOptions);
+      const upvoteMenu = new StringSelectMenuBuilder().setCustomId('radio_upvote_select').setPlaceholder('Upvote a song...').addOptions(songOptions);
+      const downvoteMenu = new StringSelectMenuBuilder().setCustomId('radio_downvote_select').setPlaceholder('Downvote a song...').addOptions(songOptions);
+      return interaction.reply({
+        embeds: [embed],
+        components: [
+          new ActionRowBuilder().addComponents(upvoteMenu),
+          new ActionRowBuilder().addComponents(downvoteMenu),
+          new ActionRowBuilder().addComponents(removeMenu),
+        ],
+        ephemeral: true,
+      });
     }
 
     if (interaction.customId === 'view_queue') {
@@ -1120,7 +1455,26 @@ client.on('interactionCreate', async interaction => { try {
         if (vq.radioSongs.length > 5) lines.push(`*...and ${vq.radioSongs.length - 5} more*`);
       }
       const embed = new EmbedBuilder().setColor(0x5865f2).setTitle('Current Queue').setDescription(lines.join('\u000A').slice(0, 4096));
-      return interaction.reply({ embeds: [embed], ephemeral: true });
+
+      // Build "Add to Playlist" select for queue songs
+      const queueSongOptions = [];
+      if (vq.currentSong) queueSongOptions.push({ label: `Now: ${vq.currentSong.title}`.slice(0, 100), value: 'current', description: vq.currentSong.uploader.slice(0, 100) });
+      vq.songs.slice(0, 24).forEach((s, i) => queueSongOptions.push({ label: `${i + 1}. ${s.title}`.slice(0, 100), value: `q_${i}`, description: s.uploader.slice(0, 100) }));
+      const queueComponents = [];
+      if (queueSongOptions.length > 0) {
+        queueComponents.push(new ActionRowBuilder().addComponents(
+          new StringSelectMenuBuilder().setCustomId('q_add_song_select').setPlaceholder('Add a song to one of your playlists...').addOptions(queueSongOptions)
+        ));
+      }
+      return interaction.reply({ embeds: [embed], components: queueComponents, ephemeral: true });
+    }
+
+    if (interaction.customId === 'clear_queue') {
+      if (!isPrivileged(interaction.member)) return interaction.reply({ content: 'Only DJs, admins, and the server owner can clear the queue.', ephemeral: true });
+      if (queue.songs.length === 0) return interaction.reply({ content: 'The queue is already empty.', ephemeral: true });
+      const count = queue.songs.length;
+      queue.songs = [];
+      return interaction.reply({ content: `Cleared **${count}** song(s) from the queue. Currently playing song is unaffected.`, ephemeral: true });
     }
 
     if (interaction.customId === 'server_favorites') {
@@ -1161,6 +1515,18 @@ client.on('interactionCreate', async interaction => { try {
         }
       }
 
+      // Community Radio pool (full + per-genre)
+      const radioPool = loadRadio();
+      if (radioPool.length > 0 && options.length < 25) {
+        options.push({ label: 'Community Radio', value: 'radio_all', description: `${radioPool.length} songs · weighted shuffle` });
+        const genres = [...new Set(radioPool.map(s => s.genre).filter(Boolean))];
+        for (const g of genres) {
+          if (options.length >= 25) break;
+          const count = radioPool.filter(s => s.genre === g).length;
+          options.push({ label: `Community Radio — ${g}`, value: `radio_genre_${g}`, description: `${count} songs · ${g}` });
+        }
+      }
+
       const components = [];
       if (options.length > 0) {
         const menu = new StringSelectMenuBuilder().setCustomId('playlist_select').setPlaceholder('Pick a playlist').addOptions(options.slice(0, 25));
@@ -1188,190 +1554,18 @@ client.on('interactionCreate', async interaction => { try {
       modal.addComponents(new ActionRowBuilder().addComponents(nameInput));
       return interaction.showModal(modal);
     }
-  }
 
-
-    if (interaction.customId === 'help') {
-      const embed = new EmbedBuilder()
-        .setColor(0x5865f2)
-        .setTitle('HypeBot — Guide')
-        .addFields(
-          {
-            name: 'Playback',
-            value: [
-              '**Pause** — Pause or resume',
-              '**Skip** — Admins skip instantly. Everyone else votes (majority wins)',
-              '**Stop** — Stop playback and disconnect',
-              '**Bass Boost** — Toggle bass EQ (blue = active)',
-              '`/play <name or URL>` — Search by name or paste a YouTube/SoundCloud/Spotify link',
-              '`/pause` · `/skip` · `/stop` · `/loop` · `/volume <0-150>`',
-            ].join('\n'),
-            inline: false,
-          },
-          {
-            name: 'Queue',
-            value: [
-              '**View Queue** — See the full queue with requesters',
-              '`/queue` · `/remove <number>`',
-            ].join('\n'),
-            inline: false,
-          },
-          {
-            name: 'Favorites',
-            value: [
-              '**Favorite** — Save the current song to your favorites',
-              '**Playlists → Server Favorites** — Browse and play anyone\'s saved favorites',
-              '`/fav add` · `/fav list` · `/fav play <number>` · `/fav remove <number>`',
-            ].join('\n'),
-            inline: false,
-          },
-          {
-            name: 'Playlists',
-            value: [
-              '**Playlists** — Browse all favorites playlists and custom playlists',
-              '**Create Playlist** (inside Playlists) — Name and create your own playlist',
-              'Pick any playlist → **Play** or **Shuffle**',
-              '`/playlist add <name>` — Add current song to a playlist',
-              '`/playlist list` — See all your playlists',
-              '`/playlist remove <name> <number>` — Remove a song',
-              '`/playlist delete <name>` — Delete an entire playlist',
-            ].join('\n'),
-            inline: false,
-          },
-          {
-            name: 'Community Radio',
-            value: [
-              '**Community Radio** — Shuffle and play the server radio pool',
-              '**Add to Radio** (inside Community Radio) — Add current song to the pool',
-              '**View Pool** (inside Community Radio) — See all songs in the pool',
-              '**Autoplay** (inside Community Radio) — Auto-queue a related song when queue empties',
-              'Radio plays automatically when your queue runs out',
-            ].join('\n'),
-            inline: false,
-          },
-          {
-            name: 'History & Stats',
-            value: [
-              '**History** — Last 10 songs played on this server',
-              '`/history` · `/stats`',
-            ].join('\n'),
-            inline: false,
-          }
-        )
-        .setFooter({ text: 'All button responses are private — only you can see them.' });
-      return interaction.reply({ embeds: [embed], ephemeral: true });
-    }
-
-  // --- Modal Submissions ---
-  if (interaction.isModalSubmit()) {
-    if (interaction.customId === 'modal_create_playlist') {
-      const name = interaction.fields.getTextInputValue('playlist_name').trim();
-      if (!name) return interaction.reply({ content: 'Playlist name cannot be empty.', ephemeral: true });
-      const created = createPlaylist(interaction.user.id, interaction.user.username, name);
-      if (!created) return interaction.reply({ content: `You already have a playlist named **${name}**.`, ephemeral: true });
-      return interaction.reply({ content: `Playlist **${name}** created. While a song is playing, use \`/playlist add\` to add songs to it.`, ephemeral: true });
-    }
-  }
-
-  // --- Select Menu Interactions ---
-  if (interaction.isStringSelectMenu()) {
-    const queue = getQueue(interaction.guild.id);
-
-    if (interaction.customId === 'search_select') {
-      const url = interaction.values[0];
-      const voiceChannel = interaction.member.voice.channel;
-      if (!voiceChannel) return interaction.update({ content: 'Join a voice channel first.', components: [], embeds: [] });
-
-      await interaction.update({ content: 'Loading...', components: [], embeds: [] });
-      try {
-        const song = await getSongInfo(url);
-        song.streamUrl = null; // Don't cache the CDN URL — fetch fresh at play time to avoid stale/expired URLs
-        song.requestedBy = interaction.user.username;
-        queue.songs.push(song);
-        const isNew = ensurePlayer(interaction.guild, voiceChannel, interaction.channel);
-        if (isNew) {
-          const next = queue.songs.shift();
-          await playSong(interaction.guild, next);
-          await interaction.editReply({ content: `Now playing **${next.title}**` });
-        } else {
-          await interaction.editReply({ content: `Added **${song.title}** to the queue. Position: ${queue.songs.length}` });
-        }
-      } catch (err) {
-        console.error(err);
-        await interaction.editReply({ content: 'Could not load that song. Try searching again.' });
-      }
-      return;
-    }
-
-    if (interaction.customId === 'sf_user_select') {
-      const targetId = interaction.values[0];
-      const data = loadFavorites();
-      const entry = data[targetId];
-      if (!entry || entry.songs.length === 0) return interaction.update({ content: 'That user has no favorites.', components: [], embeds: [] });
-
-      let member = null;
-      try { member = await interaction.guild.members.fetch(targetId); } catch {}
-      const username = member ? member.user.username : entry.username;
-      const avatarURL = member ? member.user.displayAvatarURL({ size: 256 }) : null;
-
-      const embed = new EmbedBuilder()
-        .setColor(0x5865f2)
-        .setAuthor({ name: `${username}'s Favorites`, iconURL: avatarURL || undefined })
-        .setThumbnail(avatarURL)
-        .setDescription(
-          entry.songs.map((s, i) => `**${i + 1}.** ${s.uploader} \u2014 ${s.title}${s.duration ? ` (${formatDuration(s.duration)})` : ''}`).slice(0, 15).join('\u000A') +
-          (entry.songs.length > 15 ? `\u000A*...and ${entry.songs.length - 15} more*` : '')
-        );
-
-      const menu = new StringSelectMenuBuilder()
-        .setCustomId(`sf_song_select_${targetId}`)
-        .setPlaceholder(`Pick a song from ${username}'s favorites`)
-        .addOptions(entry.songs.slice(0, 25).map((song, i) => ({
-          label: song.title.slice(0, 100),
-          value: String(i),
-          description: `${song.uploader}${song.duration ? ` \u00B7 ${formatDuration(song.duration)}` : ''}`.slice(0, 100),
-        })));
-      return interaction.update({ content: null, embeds: [embed], components: [new ActionRowBuilder().addComponents(menu)] });
-    }
-
-    if (interaction.customId === 'playlist_select') {
-      const value = interaction.values[0];
-      let songs, title;
-
-      if (value.startsWith('fav_')) {
-        const userId = value.slice(4);
-        const data = loadFavorites();
-        const entry = data[userId];
-        if (!entry || entry.songs.length === 0) return interaction.update({ content: 'That playlist is empty.', components: [], embeds: [] });
-        let member = null;
-        try { member = await interaction.guild.members.fetch(userId); } catch {}
-        const username = member ? member.user.username : entry.username;
-        songs = entry.songs;
-        title = `${username}'s Favorites Playlist`;
-      } else {
-        // pl_userId||playlistName
-        const sep = value.slice(3).indexOf('||');
-        const userId = value.slice(3, 3 + sep);
-        const playlistName = value.slice(3 + sep + 2);
-        const data = loadPlaylists();
-        const pl = data[userId]?.playlists?.[playlistName];
-        if (!pl || pl.songs.length === 0) return interaction.update({ content: 'That playlist is empty.', components: [], embeds: [] });
-        songs = pl.songs;
-        title = pl.name;
-      }
-
-      const preview = songs.slice(0, 10).map((s, i) => `**${i + 1}.** ${s.uploader} — ${s.title}${s.duration ? ` (${formatDuration(s.duration)})` : ''}`).join('\n');
-      const embed = new EmbedBuilder()
-        .setColor(0x5865f2)
-        .setTitle(title)
-        .setDescription(preview + (songs.length > 10 ? `\n*...and ${songs.length - 10} more*` : ''))
-        .setFooter({ text: `${songs.length} song(s) total` });
-
-      const row = new ActionRowBuilder().addComponents(
-        new ButtonBuilder().setCustomId(`playlist_play_${value}`).setLabel('Play').setStyle(ButtonStyle.Primary),
-        new ButtonBuilder().setCustomId(`playlist_shuffle_${value}`).setLabel('Shuffle').setStyle(ButtonStyle.Success)
-      );
-      return interaction.update({ content: null, embeds: [embed], components: [row] });
+    if (interaction.customId === 'add_to_playlist_hub') {
+      if (!queue.currentSong) return interaction.reply({ content: 'Nothing is playing right now.', ephemeral: true });
+      const editable = getEditablePlaylists(interaction.user.id);
+      if (editable.length === 0) return interaction.reply({ content: 'You have no playlists yet. Create one via the Playlists button first.', ephemeral: true });
+      const options = editable.slice(0, 25).map(e => ({
+        label: e.isOwn ? e.name : `${e.ownerUsername}: ${e.name}`,
+        value: `${e.ownerId}||${e.name}`,
+        description: `${e.songs.length} song(s)`,
+      }));
+      const menu = new StringSelectMenuBuilder().setCustomId('hub_pl_select').setPlaceholder('Pick a playlist').addOptions(options);
+      return interaction.reply({ content: `Add **${queue.currentSong.title}** to which playlist?`, components: [new ActionRowBuilder().addComponents(menu)], ephemeral: true });
     }
 
     if (interaction.customId.startsWith('playlist_play_') || interaction.customId.startsWith('playlist_shuffle_')) {
@@ -1417,6 +1611,296 @@ client.on('interactionCreate', async interaction => { try {
         return interaction.update({ content: `Added **${title}**${isShuffled ? ' (shuffled)' : ''} — **${songs.length} songs** queued.`, components: [], embeds: [] });
       }
     }
+  }
+
+
+    if (interaction.customId === 'help') {
+      const embed = new EmbedBuilder()
+        .setColor(0x5865f2)
+        .setTitle('HypeBot — Guide')
+        .addFields(
+          {
+            name: 'Playback',
+            value: [
+              '**Pause** — Pause or resume',
+              '**Skip** — Admins skip instantly. Everyone else votes (majority wins)',
+              '**Stop** — Stop playback and disconnect',
+              '**Bass Boost** — Toggle bass EQ (blue = active)',
+              '`/play <name or URL>` — Search by name or paste a YouTube/SoundCloud/Spotify link',
+              '`/pause` · `/skip` · `/stop` · `/loop` · `/volume <0-150>`',
+            ].join('\n'),
+            inline: false,
+          },
+          {
+            name: 'Queue',
+            value: [
+              '**View Queue** — See the full queue with requesters',
+              '**Clear Queue** — Wipe the entire queue instantly (currently playing song is unaffected)',
+              '`/queue` · `/remove <number>`',
+              '`/purge <start> [end]` — Remove a range (e.g. `/purge 5 200`). Omit end to clear everything from that position onward.',
+            ].join('\n'),
+            inline: false,
+          },
+          {
+            name: 'Favorites',
+            value: [
+              '**Favorite** — Save the current song to your favorites',
+              '**Playlists → Server Favorites** — Browse and play anyone\'s saved favorites',
+              '`/fav add` · `/fav list` · `/fav play <number>` · `/fav remove <number>`',
+            ].join('\n'),
+            inline: false,
+          },
+          {
+            name: 'Playlists',
+            value: [
+              '**Playlists** — Browse all favorites playlists and custom playlists',
+              '**Create Playlist** (inside Playlists) — Name and create your own playlist',
+              'Pick any playlist → **Play** or **Shuffle**',
+              '**Add to Playlist** button — Instantly save the current song (pick from your playlists)',
+              '**View Queue** → dropdown — Add any queued song to a playlist',
+              '**History** → dropdown — Add a recently played song to a playlist',
+              '`/fav list` → dropdown — Add any favorite to a playlist',
+              '`/playlist add <name>` — Add the current song to a playlist',
+              '`/playlist add <name> <song or URL>` — Add any song without playing it first',
+              '`/playlist save <name>` — Dump the entire queue into a playlist (creates it if needed)',
+              '`/playlist list` — See all your playlists and shared playlists',
+              '`/playlist remove <name> <number>` — Remove a song',
+              '`/playlist delete <name>` — Delete an entire playlist',
+              '`/playlist invite <name> @user` — Give someone edit access to your playlist',
+              '`/playlist revoke <name> @user` — Remove someone\'s edit access',
+            ].join('\n'),
+            inline: false,
+          },
+          {
+            name: 'Community Radio',
+            value: [
+              '**Community Radio** — Shuffle and play the server radio pool',
+              '**Add to Radio** (inside Community Radio) — Add current song to the pool',
+              '**View Pool** (inside Community Radio) — See all songs in the pool',
+              '**Autoplay** (inside Community Radio) — Auto-queue a related song when queue empties',
+              'Radio plays automatically when your queue runs out',
+            ].join('\n'),
+            inline: false,
+          },
+          {
+            name: 'History & Stats',
+            value: [
+              '**History** — Last 10 songs played on this server',
+              '`/history` · `/stats`',
+            ].join('\n'),
+            inline: false,
+          }
+        )
+        .setFooter({ text: 'All button responses are private — only you can see them.' });
+      return interaction.reply({ embeds: [embed], ephemeral: true });
+    }
+
+  // --- Modal Submissions ---
+  if (interaction.isModalSubmit()) {
+    if (interaction.customId === 'modal_create_playlist') {
+      const name = interaction.fields.getTextInputValue('playlist_name').trim();
+      if (!name) return interaction.reply({ content: 'Playlist name cannot be empty.', ephemeral: true });
+      const created = createPlaylist(interaction.user.id, interaction.user.username, name);
+      if (!created) return interaction.reply({ content: `You already have a playlist named **${name}**.`, ephemeral: true });
+      return interaction.reply({ content: `Playlist **${name}** created.\n\n**Ways to add songs:**\n• **Add to Playlist** button on the hub — adds the current song instantly\n• \`/playlist add ${name}\` — adds the current song\n• \`/playlist add ${name} <song name or URL>\` — adds any song without playing it\n• \`/playlist save ${name}\` — dumps your entire queue into this playlist\n• **View Queue** → dropdown — pick any queued song\n• **History** → dropdown — pick from recently played\n• \`/fav list\` → dropdown — pick from your favorites`, ephemeral: true });
+    }
+
+    if (interaction.customId === 'modal_add_to_radio') {
+      const queue = getQueue(interaction.guild.id);
+      if (!queue.currentSong) return interaction.reply({ content: 'The song stopped before you could add it.', ephemeral: true });
+      const pool = loadRadio();
+      const song = queue.currentSong;
+      if (pool.some(s => s.url === song.url)) return interaction.reply({ content: `**${song.title}** is already in the Community Radio pool.`, ephemeral: true });
+      const genreRaw = interaction.fields.getTextInputValue('radio_genre').trim();
+      const genre = genreRaw || null;
+      pool.push({ title: song.title, uploader: song.uploader, url: song.url, duration: song.duration, thumbnail: song.thumbnail, addedBy: interaction.user.username, genre, upvotes: [], downvotes: [] });
+      saveRadio(pool);
+      const genreLabel = genre ? ` as **[${genre}]**` : '';
+      return interaction.reply({ content: `Added **${song.title}**${genreLabel} to Community Radio. Pool is now **${pool.length} song(s)**.`, ephemeral: true });
+    }
+  }
+
+  // --- Select Menu Interactions ---
+  if (interaction.isStringSelectMenu()) {
+    const queue = getQueue(interaction.guild.id);
+
+    if (interaction.customId === 'search_select') {
+      const url = interaction.values[0];
+      const voiceChannel = interaction.member.voice.channel;
+      if (!voiceChannel) return interaction.update({ content: 'Join a voice channel first.', components: [], embeds: [] });
+
+      await interaction.update({ content: 'Loading...', components: [], embeds: [] });
+      try {
+        const song = await getSongInfo(url);
+        song.streamUrl = null; // Don't cache the CDN URL — fetch fresh at play time to avoid stale/expired URLs
+        song.requestedBy = interaction.user.username;
+        queue.songs.push(song);
+        const isNew = ensurePlayer(interaction.guild, voiceChannel, interaction.channel);
+        if (isNew) {
+          const next = queue.songs.shift();
+          await playSong(interaction.guild, next);
+          await interaction.editReply({ content: `Now playing **${next.title}**` });
+        } else {
+          await interaction.editReply({ content: `Added **${song.title}** to the queue. Position: ${queue.songs.length}` });
+        }
+      } catch (err) {
+        console.error(err);
+        await interaction.editReply({ content: 'Could not load that song. Try searching again.' });
+      }
+      return;
+    }
+
+    if (interaction.customId === 'radio_remove_select') {
+      const idx = parseInt(interaction.values[0]);
+      const pool = loadRadio();
+      if (idx < 0 || idx >= pool.length) return interaction.update({ content: 'That song is no longer in the pool.', components: [], embeds: [] });
+      const removed = pool.splice(idx, 1)[0];
+      saveRadio(pool);
+      return interaction.update({ content: `Removed **${removed.title}** from Community Radio. Pool is now **${pool.length} song(s)**.`, components: [], embeds: [] });
+    }
+
+    if (interaction.customId === 'radio_upvote_select') {
+      const idx = parseInt(interaction.values[0]);
+      const pool = loadRadio();
+      if (idx < 0 || idx >= pool.length) return interaction.update({ content: 'That song is no longer in the pool.', components: [], embeds: [] });
+      const song = pool[idx];
+      if (!song.upvotes) song.upvotes = [];
+      if (!song.downvotes) song.downvotes = [];
+      if (song.upvotes.includes(interaction.user.id)) return interaction.update({ content: `You already upvoted **${song.title}**.`, components: [], embeds: [] });
+      song.downvotes = song.downvotes.filter(id => id !== interaction.user.id);
+      song.upvotes.push(interaction.user.id);
+      saveRadio(pool);
+      return interaction.update({ content: `Upvoted **${song.title}** — +${song.upvotes.length}/-${song.downvotes.length}`, components: [], embeds: [] });
+    }
+
+    if (interaction.customId === 'radio_downvote_select') {
+      const idx = parseInt(interaction.values[0]);
+      const pool = loadRadio();
+      if (idx < 0 || idx >= pool.length) return interaction.update({ content: 'That song is no longer in the pool.', components: [], embeds: [] });
+      const song = pool[idx];
+      if (!song.upvotes) song.upvotes = [];
+      if (!song.downvotes) song.downvotes = [];
+      if (song.downvotes.includes(interaction.user.id)) return interaction.update({ content: `You already downvoted **${song.title}**.`, components: [], embeds: [] });
+      song.upvotes = song.upvotes.filter(id => id !== interaction.user.id);
+      song.downvotes.push(interaction.user.id);
+      saveRadio(pool);
+      return interaction.update({ content: `Downvoted **${song.title}** — +${song.upvotes.length}/-${song.downvotes.length}`, components: [], embeds: [] });
+    }
+
+    if (interaction.customId === 'radio_genre_select') {
+      const genre = interaction.values[0];
+      const pool = loadRadio();
+      const filtered = genre === 'all' ? pool : pool.filter(s => s.genre === genre);
+      if (filtered.length === 0) return interaction.update({ content: `No songs tagged as **${genre}** in the pool.`, components: [], embeds: [] });
+      const queueState = getQueue(interaction.guild.id);
+      const voiceChannel = interaction.member.voice.channel;
+      if (!voiceChannel) return interaction.update({ content: 'Join a voice channel first.', components: [], embeds: [] });
+      const shuffled = weightedShuffle(filtered);
+      queueState.radioSongs = shuffled.map(s => ({ ...s, streamUrl: null, requestedBy: 'Community Radio' }));
+      const isNew = ensurePlayer(interaction.guild, voiceChannel, interaction.channel);
+      if (isNew) {
+        await interaction.update({ content: `Loading Community Radio${genre !== 'all' ? ` [${genre}]` : ''}...`, components: [], embeds: [] });
+        const next = queueState.radioSongs.shift();
+        await playSong(interaction.guild, next);
+        return interaction.editReply({ content: `Community Radio${genre !== 'all' ? ` [${genre}]` : ''} started \u2014 **${filtered.length} songs** shuffled.` });
+      } else {
+        return interaction.update({ content: `Community Radio${genre !== 'all' ? ` [${genre}]` : ''} queued \u2014 **${filtered.length} songs** will play after your current queue finishes.`, components: [], embeds: [] });
+      }
+    }
+
+    if (interaction.customId === 'sf_user_select') {
+      const targetId = interaction.values[0];
+      const data = loadFavorites();
+      const entry = data[targetId];
+      if (!entry || entry.songs.length === 0) return interaction.update({ content: 'That user has no favorites.', components: [], embeds: [] });
+
+      let member = null;
+      try { member = await interaction.guild.members.fetch(targetId); } catch {}
+      const username = member ? member.user.username : entry.username;
+      const avatarURL = member ? member.user.displayAvatarURL({ size: 256 }) : null;
+
+      const embed = new EmbedBuilder()
+        .setColor(0x5865f2)
+        .setAuthor({ name: `${username}'s Favorites`, iconURL: avatarURL || undefined })
+        .setThumbnail(avatarURL)
+        .setDescription(
+          entry.songs.map((s, i) => `**${i + 1}.** ${s.uploader} \u2014 ${s.title}${s.duration ? ` (${formatDuration(s.duration)})` : ''}`).slice(0, 15).join('\u000A') +
+          (entry.songs.length > 15 ? `\u000A*...and ${entry.songs.length - 15} more*` : '')
+        );
+
+      const menu = new StringSelectMenuBuilder()
+        .setCustomId(`sf_song_select_${targetId}`)
+        .setPlaceholder(`Pick a song from ${username}'s favorites`)
+        .addOptions(entry.songs.slice(0, 25).map((song, i) => ({
+          label: song.title.slice(0, 100),
+          value: String(i),
+          description: `${song.uploader}${song.duration ? ` \u00B7 ${formatDuration(song.duration)}` : ''}`.slice(0, 100),
+        })));
+      return interaction.update({ content: null, embeds: [embed], components: [new ActionRowBuilder().addComponents(menu)] });
+    }
+
+    if (interaction.customId === 'playlist_select') {
+      const value = interaction.values[0];
+
+      // Community Radio playlists — start immediately (radio is always shuffled)
+      if (value === 'radio_all' || value.startsWith('radio_genre_')) {
+        const pool = loadRadio();
+        const genre = value === 'radio_all' ? null : value.slice('radio_genre_'.length);
+        const filtered = genre ? pool.filter(s => s.genre === genre) : pool;
+        if (filtered.length === 0) return interaction.update({ content: 'That radio pool is empty.', components: [], embeds: [] });
+        const voiceChannel = interaction.member.voice.channel;
+        if (!voiceChannel) return interaction.update({ content: 'Join a voice channel first.', components: [], embeds: [] });
+        const radioQueue = getQueue(interaction.guild.id);
+        const shuffled = weightedShuffle(filtered);
+        radioQueue.radioSongs = shuffled.map(s => ({ ...s, streamUrl: null, requestedBy: genre ? `Community Radio [${genre}]` : 'Community Radio' }));
+        const isNew = ensurePlayer(interaction.guild, voiceChannel, interaction.channel);
+        if (isNew) {
+          await interaction.update({ content: `Loading Community Radio${genre ? ` [${genre}]` : ''}...`, components: [], embeds: [] });
+          const next = radioQueue.radioSongs.shift();
+          await playSong(interaction.guild, next);
+          return interaction.editReply({ content: `Community Radio${genre ? ` [${genre}]` : ''} started \u2014 **${filtered.length} songs** shuffled.` });
+        } else {
+          return interaction.update({ content: `Community Radio${genre ? ` [${genre}]` : ''} queued \u2014 **${filtered.length} songs** will play after your current queue finishes.`, components: [], embeds: [] });
+        }
+      }
+
+      let songs, title;
+
+      if (value.startsWith('fav_')) {
+        const userId = value.slice(4);
+        const data = loadFavorites();
+        const entry = data[userId];
+        if (!entry || entry.songs.length === 0) return interaction.update({ content: 'That playlist is empty.', components: [], embeds: [] });
+        let member = null;
+        try { member = await interaction.guild.members.fetch(userId); } catch {}
+        const username = member ? member.user.username : entry.username;
+        songs = entry.songs;
+        title = `${username}'s Favorites Playlist`;
+      } else {
+        // pl_userId||playlistName
+        const sep = value.slice(3).indexOf('||');
+        const userId = value.slice(3, 3 + sep);
+        const playlistName = value.slice(3 + sep + 2);
+        const data = loadPlaylists();
+        const pl = data[userId]?.playlists?.[playlistName];
+        if (!pl || pl.songs.length === 0) return interaction.update({ content: 'That playlist is empty.', components: [], embeds: [] });
+        songs = pl.songs;
+        title = pl.name;
+      }
+
+      const preview = songs.slice(0, 10).map((s, i) => `**${i + 1}.** ${s.uploader} — ${s.title}${s.duration ? ` (${formatDuration(s.duration)})` : ''}`).join('\n');
+      const embed = new EmbedBuilder()
+        .setColor(0x5865f2)
+        .setTitle(title)
+        .setDescription(preview + (songs.length > 10 ? `\n*...and ${songs.length - 10} more*` : ''))
+        .setFooter({ text: `${songs.length} song(s) total` });
+
+      const row = new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId(`playlist_play_${value}`).setLabel('Play').setStyle(ButtonStyle.Primary),
+        new ButtonBuilder().setCustomId(`playlist_shuffle_${value}`).setLabel('Shuffle').setStyle(ButtonStyle.Success)
+      );
+      return interaction.update({ content: null, embeds: [embed], components: [row] });
+    }
 
     if (interaction.customId.startsWith('sf_song_select_')) {
       const targetId = interaction.customId.replace('sf_song_select_', '');
@@ -1442,10 +1926,140 @@ client.on('interactionCreate', async interaction => { try {
         return interaction.update({ content: `Added **${song.title}** from ${entry.username}'s favorites to the queue. Position: ${queue.songs.length}`, components: [], embeds: [] });
       }
     }
+
+    // --- Hub "Add to Playlist" playlist picker ---
+    if (interaction.customId === 'hub_pl_select') {
+      const sep = interaction.values[0].indexOf('||');
+      const ownerId = interaction.values[0].slice(0, sep);
+      const playlistName = interaction.values[0].slice(sep + 2);
+      if (!queue.currentSong) return interaction.update({ content: 'The song stopped before you could add it.', components: [], embeds: [] });
+      const added = addToPlaylist(interaction.user.id, ownerId, playlistName, queue.currentSong);
+      if (!added) return interaction.update({ content: `**${queue.currentSong.title}** is already in **${playlistName}**.`, components: [], embeds: [] });
+      return interaction.update({ content: `Added **${queue.currentSong.title}** to **${playlistName}**.`, components: [], embeds: [] });
+    }
+
+    // --- Queue "Add to Playlist" — step 1: pick song ---
+    if (interaction.customId === 'q_add_song_select') {
+      const songKey = interaction.values[0]; // "current" or "q_N"
+      let song;
+      if (songKey === 'current') {
+        song = queue.currentSong;
+      } else {
+        const idx = parseInt(songKey.slice(2));
+        song = queue.songs[idx];
+      }
+      if (!song) return interaction.reply({ content: 'That song is no longer in the queue.', ephemeral: true });
+      const qEditable = getEditablePlaylists(interaction.user.id);
+      if (qEditable.length === 0) return interaction.reply({ content: 'You have no playlists yet. Create one via the Playlists button first.', ephemeral: true });
+      const options = qEditable.slice(0, 25).map(e => ({ label: e.isOwn ? e.name : `${e.ownerUsername}: ${e.name}`, value: `${e.ownerId}||${e.name}`, description: `${e.songs.length} song(s)` }));
+      const menu = new StringSelectMenuBuilder().setCustomId(`q_add_pl_select_${songKey}`).setPlaceholder('Pick a playlist').addOptions(options);
+      return interaction.reply({ content: `Add **${song.title}** to which playlist?`, components: [new ActionRowBuilder().addComponents(menu)], ephemeral: true });
+    }
+
+    // --- Queue "Add to Playlist" — step 2: pick playlist ---
+    if (interaction.customId.startsWith('q_add_pl_select_')) {
+      const songKey = interaction.customId.slice('q_add_pl_select_'.length);
+      const sep = interaction.values[0].indexOf('||');
+      const ownerId = interaction.values[0].slice(0, sep);
+      const playlistName = interaction.values[0].slice(sep + 2);
+      let song;
+      if (songKey === 'current') {
+        song = queue.currentSong;
+      } else {
+        const idx = parseInt(songKey.slice(2));
+        song = queue.songs[idx];
+      }
+      if (!song) return interaction.update({ content: 'That song is no longer in the queue.', components: [], embeds: [] });
+      const added = addToPlaylist(interaction.user.id, ownerId, playlistName, song);
+      if (!added) return interaction.update({ content: `**${song.title}** is already in **${playlistName}**.`, components: [], embeds: [] });
+      return interaction.update({ content: `Added **${song.title}** to **${playlistName}**.`, components: [], embeds: [] });
+    }
+
+    // --- History "Add to Playlist" — step 1: pick song ---
+    if (interaction.customId === 'hist_add_song_select') {
+      const histIdx = parseInt(interaction.values[0]);
+      const hEditable = getEditablePlaylists(interaction.user.id);
+      if (hEditable.length === 0) return interaction.reply({ content: 'You have no playlists yet. Create one via the Playlists button first.', ephemeral: true });
+      const history = loadHistory().filter(h => h.guildId === interaction.guild.id);
+      const last10 = history.slice(-10).reverse();
+      const entry = last10[histIdx];
+      if (!entry) return interaction.reply({ content: 'Could not find that song in history.', ephemeral: true });
+      const options = hEditable.slice(0, 25).map(e => ({ label: e.isOwn ? e.name : `${e.ownerUsername}: ${e.name}`, value: `${e.ownerId}||${e.name}`, description: `${e.songs.length} song(s)` }));
+      const menu = new StringSelectMenuBuilder().setCustomId(`hist_add_pl_select_${histIdx}`).setPlaceholder('Pick a playlist').addOptions(options);
+      return interaction.reply({ content: `Add **${entry.title}** to which playlist?`, components: [new ActionRowBuilder().addComponents(menu)], ephemeral: true });
+    }
+
+    // --- History "Add to Playlist" — step 2: pick playlist ---
+    if (interaction.customId.startsWith('hist_add_pl_select_')) {
+      const histIdx = parseInt(interaction.customId.slice('hist_add_pl_select_'.length));
+      const sep = interaction.values[0].indexOf('||');
+      const ownerId = interaction.values[0].slice(0, sep);
+      const playlistName = interaction.values[0].slice(sep + 2);
+      const history = loadHistory().filter(h => h.guildId === interaction.guild.id);
+      const last10 = history.slice(-10).reverse();
+      const entry = last10[histIdx];
+      if (!entry) return interaction.update({ content: 'Could not find that song in history.', components: [], embeds: [] });
+      const song = { title: entry.title, uploader: entry.uploader, url: entry.url, duration: null, thumbnail: null };
+      const added = addToPlaylist(interaction.user.id, ownerId, playlistName, song);
+      if (!added) return interaction.update({ content: `**${entry.title}** is already in **${playlistName}**.`, components: [], embeds: [] });
+      return interaction.update({ content: `Added **${entry.title}** to **${playlistName}**.`, components: [], embeds: [] });
+    }
+
+    // --- Favorites "Add to Playlist" — step 1: pick song ---
+    if (interaction.customId === 'fav_to_pl_song_select') {
+      const [targetId, favIdxStr] = interaction.values[0].split('||');
+      const favIdx = parseInt(favIdxStr);
+      const fEditable = getEditablePlaylists(interaction.user.id);
+      if (fEditable.length === 0) return interaction.reply({ content: 'You have no playlists yet. Create one via the Playlists button first.', ephemeral: true });
+      const favs = getUserFavorites(targetId);
+      const song = favs[favIdx];
+      if (!song) return interaction.reply({ content: 'Could not find that favorite.', ephemeral: true });
+      const options = fEditable.slice(0, 25).map(e => ({ label: e.isOwn ? e.name : `${e.ownerUsername}: ${e.name}`, value: `${e.ownerId}||${e.name}`, description: `${e.songs.length} song(s)` }));
+      const menu = new StringSelectMenuBuilder().setCustomId(`fav_to_pl_pl_select_${targetId}|${favIdx}`).setPlaceholder('Pick a playlist').addOptions(options);
+      return interaction.reply({ content: `Add **${song.title}** to which playlist?`, components: [new ActionRowBuilder().addComponents(menu)], ephemeral: true });
+    }
+
+    // --- Favorites "Add to Playlist" — step 2: pick playlist ---
+    if (interaction.customId.startsWith('fav_to_pl_pl_select_')) {
+      const parts = interaction.customId.slice('fav_to_pl_pl_select_'.length).split('|');
+      const targetId = parts[0];
+      const favIdx = parseInt(parts[1]);
+      const sep = interaction.values[0].indexOf('||');
+      const ownerId = interaction.values[0].slice(0, sep);
+      const playlistName = interaction.values[0].slice(sep + 2);
+      const favs = getUserFavorites(targetId);
+      const song = favs[favIdx];
+      if (!song) return interaction.update({ content: 'Could not find that favorite.', components: [], embeds: [] });
+      const added = addToPlaylist(interaction.user.id, ownerId, playlistName, song);
+      if (!added) return interaction.update({ content: `**${song.title}** is already in **${playlistName}**.`, components: [], embeds: [] });
+      return interaction.update({ content: `Added **${song.title}** to **${playlistName}**.`, components: [], embeds: [] });
+    }
   }
   } catch (err) {
     console.error('Interaction error:', err.message);
   }
 });
+
+client.on('error', err => console.error('Discord client error:', err.message));
+process.on('unhandledRejection', err => console.error('Unhandled rejection:', err?.message ?? err));
+
+// YouTube changes frequently enough that yt-dlp goes stale within weeks — keep it current
+// without relying on redeploys, since this bot runs 24/7 and may not get redeployed often.
+function updateYtDlp() {
+  const proc = spawn('pip3', ['install', '--upgrade', 'yt-dlp', '--break-system-packages']);
+  let output = '';
+  proc.stdout.on('data', chunk => (output += chunk));
+  proc.stderr.on('data', chunk => (output += chunk));
+  proc.on('close', code => {
+    const summary = output.trim().split('\n').pop();
+    if (code === 0) {
+      console.log('yt-dlp update check:', summary);
+    } else {
+      console.error('yt-dlp update failed:', summary);
+    }
+  });
+}
+updateYtDlp();
+setInterval(updateYtDlp, 7 * 24 * 60 * 60 * 1000);
 
 client.login(process.env.DISCORD_TOKEN);
